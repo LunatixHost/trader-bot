@@ -228,6 +228,14 @@ def get_futures_entry_block_reason(ps, fp: FuturesPaperState, side: str, bearish
     if side == "short" and getattr(ps, "trend", "chop") != "downtrend":
         return "no_trend_alignment"
 
+    # ── Regime-based bias filter ─────────────────────────────────────────────
+    # Block SHORTs during macro uptrend regimes — "death by a thousand stops"
+    # when shorting into a trending_volatile upswing.
+    regime = getattr(ps, "regime", "ranging")
+    _SHORT_FORBIDDEN_REGIMES = {"trending_volatile"}   # strong trending with high vol = dangerous to short
+    if side == "short" and regime in _SHORT_FORBIDDEN_REGIMES:
+        return "unfavorable_regime"
+
     # ── Microstructure confirmation (hard block, not penalty) ───────────────
     # Both OB imbalance AND flow ratio must be bearish.
     # A single weak signal is insufficient — we require both sellers and

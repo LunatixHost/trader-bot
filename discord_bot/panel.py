@@ -579,6 +579,7 @@ def _futures_block_label(block_reason: str) -> str:
         "no_trend_alignment":         "not in downtrend",
         "weak_bearish_microstructure":"OB/flow not bearish",
         "no_downward_momentum":       "MACD not bearish",
+        "unfavorable_regime":         "regime blocks short",
         "low_score":                  "score too low",
         "max_positions":              "max positions",
     }
