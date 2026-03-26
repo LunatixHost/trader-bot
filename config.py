@@ -12,12 +12,10 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
-CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "")
 
 # ─── Signal Thresholds ───────────────────────────────────────────────────
 RSI_BUY_THRESHOLD = 55          # RSI below this = oversold = buy signal (raised from 45 → more frequent entries)
 RSI_SELL_THRESHOLD = 70         # RSI above this = overbought = sell signal (raised from 65 → hold deeper into momentum)
-FEAR_GREED_BUY_MAX = 50         # Fear & Greed at or below = fear zone (raised from 50 → trade through optimism)
 VOLUME_SPIKE_MULTIPLIER = 1.5   # Volume 1.5x the average = spike
 CONFIDENCE_BUY_THRESHOLD = 2.7  # Min weighted score to trigger a buy (base; dynamic params scale it)
 STOP_LOSS_PCT = 0.6             # Hard stop-loss: tighter for scalping; keeps losers smaller than prior 1.0%
@@ -128,42 +126,67 @@ FAST_SCORE_THRESHOLD_REDUCTION_HARD = 1.0  # Reduction for hard fast-entry
 # Each category has a max contribution cap to total confidence
 SIGNAL_CATEGORY_CAPS = {
     "mean_reversion": 1.5,   # RSI + Bollinger
-    "momentum": 1.5,         # MACD + Google Trends
-    "sentiment": 1.2,        # News sentiment + CoinGecko volume
-    "onchain": 1.0,          # Whale + Etherscan
-    "macro": 1.0,            # Fear & Greed
+    "momentum": 1.5,         # MACD
+    "onchain": 1.0,          # Etherscan gas activity
 }
 
-# ─── Regime-Based Weight Modifiers ───────────────────────────────────────
-# Multipliers applied to signal categories based on current market regime
+# ─── Regime-Based Category Modifiers ─────────────────────────────────────
+# Multipliers applied to signal categories based on current market regime.
+# Encodes the key insight: mean-reversion signals are reliable in ranges but
+# trap-like in strong trends; momentum signals (MACD) lead in trends, chop in ranges.
 REGIME_MODIFIERS = {
     "trending": {
-        "mean_reversion": 0.9,  # RSI/BB useful for dip entries in trends (raised from 0.6)
-        "momentum": 1.4,        # MACD/trends work well
-        "sentiment": 1.0,
+        "mean_reversion": 0.9,  # RSI/BB useful for dip entries in trends
+        "momentum": 1.4,        # MACD works well
         "onchain": 1.0,
-        "macro": 1.0,
     },
     "ranging": {
         "mean_reversion": 1.4,  # RSI/BB are king in ranges
         "momentum": 0.6,        # MACD chops in ranges
-        "sentiment": 0.8,
         "onchain": 1.0,
-        "macro": 1.0,
     },
     "choppy_volatile": {
         "mean_reversion": 0.7,  # Unreliable — price whipsaws
         "momentum": 0.7,        # MACD gives false signals
-        "sentiment": 1.3,       # External catalysts matter more
         "onchain": 1.2,
-        "macro": 1.0,
     },
     "trending_volatile": {
-        "mean_reversion": 0.5,  # Very unreliable
-        "momentum": 1.3,        # Trend is strong
-        "sentiment": 1.2,       # Catalysts driving the trend
+        "mean_reversion": 0.5,  # Very unreliable in fast moves
+        "momentum": 1.3,        # Trend is strong — follow it
         "onchain": 1.0,
-        "macro": 0.8,
+    },
+}
+
+# ─── Regime-Specific Signal Modifiers (Priority 2) ───────────────────────
+# Per-signal multipliers applied ON TOP of REGIME_MODIFIERS category mults.
+# Provides signal-level granularity:
+#   - RSI/Bollinger boosted in ranging (mean-reversion edge), reduced in strong trends
+#   - MACD more reliable in trending, less in chop
+#   - Gas (Etherscan) has uniform edge regardless of regime (onchain is regime-agnostic)
+REGIME_SIGNAL_MODIFIERS = {
+    "ranging": {
+        "rsi": 1.3,         # Oversold in range = high-conviction bounce signal
+        "bollinger": 1.3,   # BB lower band in range = reliable reversal
+        "macd": 0.8,        # MACD crossovers in ranges are often false
+        "gas": 1.0,
+    },
+    "trending": {
+        "rsi": 0.8,         # RSI oversold in downtrend = catching a falling knife
+        "bollinger": 0.8,   # BB lower band in trend = not a reversal, continuation
+        "macd": 1.2,        # MACD follows the trend — trustworthy
+        "gas": 1.0,
+    },
+    "choppy_volatile": {
+        "rsi": 0.7,         # All mean-reversion signals are traps in choppy vol
+        "bollinger": 0.7,
+        "macd": 0.8,
+        "gas": 1.1,
+    },
+    "trending_volatile": {
+        "rsi": 0.6,         # RSI absolutely unreliable in velocity moves
+        "bollinger": 0.6,
+        "macd": 1.1,        # Only momentum signals have edge
+        "gas": 1.0,
     },
 }
 
@@ -201,9 +224,26 @@ FAILED_EXIT_COOLDOWN_HARD_STOP  = 1500  # 25 min after HARD_STOP
 # Priority: SHORT positions in bearish/downtrend conditions.
 FUTURES_PAPER_ENABLED               = True    # Master switch for the entire futures paper layer
 FUTURES_SHORT_ENABLED               = True    # Allow paper SHORT positions
-FUTURES_LONG_ENABLED                = False   # Paper LONG positions (disabled in v1)
+FUTURES_LONG_ENABLED                = True    # Paper LONG positions — momentum scalps only (hedged isolation)
 FUTURES_MAX_LEVERAGE                = 2.0     # Maximum simulated leverage multiplier (conservative)
-FUTURES_POSITION_SIZE_USDT          = 20.0    # Fixed notional per futures paper position (USDT)
+FUTURES_POSITION_SIZE_USDT          = 20.0    # Max notional per futures paper position (USDT) — ATR sizing uses this as cap
+# ── Priority 1: Volatility-Adjusted Score Gate ────────────────────────────
+# Minimum bearish/bullish score required before a futures entry qualifies.
+# Scaled by current regime's ATR instead of a single static value:
+#   ranging       → FUTURES_MIN_SCORE_RANGING   (1.2) — quieter, score hard to reach otherwise
+#   trending      → FUTURES_MIN_SCORE            (1.5) — baseline
+#   *_volatile    → FUTURES_MIN_SCORE_VOLATILE   (1.8) — noisy, require stronger conviction
+FUTURES_MIN_SCORE                   = 1.5     # Baseline (trending regime)
+FUTURES_MIN_SCORE_RANGING           = 1.2     # Lower bar for quiet, low-ATR ranging markets
+FUTURES_MIN_SCORE_VOLATILE          = 1.8     # Higher bar during high-volatility regimes
+# ── Priority 3: ATR-Based Position Sizing ────────────────────────────────
+# Instead of always risking a fixed $20, size each position so a hard stop
+# always loses exactly FUTURES_RISK_PCT_PER_TRADE % of total portfolio.
+# Formula: notional = (portfolio × RISK_PCT) / (atr_pct × ATR_STOP_MULT)
+# Result is capped at FUTURES_POSITION_SIZE_USDT and floored at $5.
+FUTURES_ATR_SIZING_ENABLED          = True    # Enable dynamic ATR-based position sizing
+FUTURES_RISK_PCT_PER_TRADE          = 0.005   # 0.5% of portfolio = max dollar loss per futures trade
+FUTURES_ATR_STOP_MULT               = 2.0     # ATR multiplier for expected stop-distance estimate
 FUTURES_MAX_CONCURRENT_POSITIONS    = 2       # Max open futures paper positions at once
 FUTURES_ENTRY_THRESHOLD             = 0.0     # Bearish score must reach this to open a SHORT (≥ 0)
 FUTURES_MIN_SCORE                   = 1.5     # Minimum raw bearish_score before entry qualifies
@@ -223,9 +263,13 @@ FUTURES_MIN_REWARD_PCT              = 0.50    # Min expected reward after costs 
 FUTURES_ATR_UNECONOMIC_MULT         = 2.0     # Same as spot ATR_TP_MULTIPLIER for expected move calc
 FUTURES_CHECK_INTERVAL              = 15      # Evaluation loop interval (seconds)
 # Entry quality filters (hard blocks — not penalties)
-FUTURES_OB_BEAR_MAX                 = 0.45    # OB imbalance must be BELOW this for microstructure confirmation
-FUTURES_FLOW_BEAR_MAX               = 0.45    # Flow ratio must be BELOW this for microstructure confirmation
+FUTURES_OB_BEAR_MAX                 = 0.45    # OB imbalance must be BELOW this for SHORT confirmation
+FUTURES_FLOW_BEAR_MAX               = 0.45    # Flow ratio must be BELOW this for SHORT confirmation
 FUTURES_MACD_HISTOGRAM_MAX          = 0.0     # MACD histogram must be BELOW this (negative = bearish momentum)
+FUTURES_OB_BULL_MIN                 = 0.55    # OB imbalance must be ABOVE this for LONG confirmation
+FUTURES_FLOW_BULL_MIN               = 0.55    # Flow ratio must be ABOVE this for LONG confirmation
+# Triple-long safety: if spot + LT both hold a coin, block LONG futures on that coin
+FUTURES_TRIPLE_LONG_BLOCK           = True    # Enable triple-long risk protection
 
 # ─── Long-Term Portfolio Layer ───────────────────────────────────────────
 # Passive hold layer that captures macro movement independent of scalping.
@@ -261,55 +305,18 @@ TRADING_PAIRS = [
     {"pair": "SUIUSDT",  "trade_amount_usdt": 1.20},
 ]
 
-# ─── Coin ID Mappings ────────────────────────────────────────────────────
-# CoinGecko coin IDs
-COINGECKO_IDS = {
-    "ETH": "ethereum",
-    "BTC": "bitcoin",
-    "BNB": "binancecoin",
-    "XRP": "ripple",
-    "BCH": "bitcoin-cash",
-    "SUI": "sui",
-}
-
-# Google Trends search terms
-GOOGLE_TRENDS_KEYWORDS = {
-    "ETH": "Ethereum",
-    "BTC": "Bitcoin",
-    "BNB": "BNB Binance",
-    "XRP": "XRP Ripple",
-    "BCH": "Bitcoin Cash",
-    "SUI": "Sui blockchain",
-}
-
-# CryptoCompare coin IDs (numeric)
-CRYPTOCOMPARE_COIN_IDS = {
-    "ETH": 7605,
-    "BTC": 1182,
-    "BNB": 204788,
-    "XRP": 5031,
-    "BCH": 202330,
-    "SUI": 5765842,
-}
-
 # ─── Signal Applicability Per Coin ────────────────────────────────────────
-# Whale/large-tx detection via blockchain explorers: ETH, BTC, BNB, XRP
-WHALE_ALERT_COINS = {"ETH", "BTC", "BNB", "XRP"}
-
-# Etherscan is ETH-only
+# Etherscan gas activity signal: ETH-only (on-chain activity tracking)
 ETHERSCAN_COINS = {"ETH"}
 
-# Max confidence score per pair (depends on which signals apply)
-# ETH: RSI + MACD + BB + F&G + CoinGecko + Whale + Etherscan + Trends = 8
-# BTC/BNB/XRP: no Etherscan = 7
-# BCH/SUI: no Etherscan, no Whale = 6
+# Max confidence score per pair (RSI + MACD + BB; ETH adds Etherscan gas)
 MAX_SCORE = {
-    "ETH": 8,
-    "BTC": 7,
-    "BNB": 7,
-    "XRP": 7,
-    "BCH": 6,
-    "SUI": 6,
+    "ETH": 4,
+    "BTC": 3,
+    "BNB": 3,
+    "XRP": 3,
+    "BCH": 3,
+    "SUI": 3,
 }
 
 def get_base_asset(pair: str) -> str:
@@ -334,12 +341,7 @@ FVG_OB_MIN = 0.5                # Microstructure floor for FVG entry (softer tha
 FVG_EARLY_TP_PCT = 0.25         # Accelerated take-profit for FVG entries — tighter than micro TP
 FVG_COOLDOWN_SECONDS = 300      # 5 min between FVG trades on the same pair
 FVG_ORDER_TIMEOUT = 60          # Cancel unfilled limit order after 60 seconds
-INTERVAL_COINGECKO = 60         # CoinGecko volume + market data per pair
-INTERVAL_WHALE = 120            # Whale Alert (ETH, BTC, BNB, XRP)
 INTERVAL_ETHERSCAN = 300        # Etherscan on-chain data (ETH only)
-INTERVAL_CRYPTOCOMPARE = 300    # CryptoCompare social stats per coin
-INTERVAL_GOOGLE_TRENDS = 900   # Google Trends per coin keyword
-INTERVAL_FEAR_GREED = 3600     # Fear & Greed (market-wide, once per hour)
 INTERVAL_FVG = 60              # Fair Value Gap detection per pair (5m candles)
 INTERVAL_DISCORD_PANEL = 30    # Discord panel poll interval — 30 s reduces edit frequency and 429 rate-limit risk
 INTERVAL_PORTFOLIO_SNAPSHOT = 1800  # Save portfolio snapshot every 30 min

@@ -14,18 +14,13 @@ from config import (
     PORTFOLIO_MAX_POSITIONS,
     RSI_BUY_THRESHOLD,
     RSI_SELL_THRESHOLD,
-    FEAR_GREED_BUY_MAX,
     STOP_LOSS_PCT,
     CONFIDENCE_BUY_THRESHOLD,
     TRADE_SIZE_PCT,
     MAX_POSITION_PCT,
     PROFIT_TARGET_PCT,
     INTERVAL_RSI,
-    INTERVAL_COINGECKO,
-    INTERVAL_WHALE,
     INTERVAL_ETHERSCAN,
-    INTERVAL_GOOGLE_TRENDS,
-    INTERVAL_FEAR_GREED,
     INTERVAL_DISCORD_PANEL,
     PORTFOLIO_REBALANCE_INTERVAL,
     TRADE_COOLDOWN_SECONDS,
@@ -413,7 +408,6 @@ def _watch_block(ps, state) -> str:
     flow = getattr(ps, "flow_ratio", 0.5)
     bos_icon = _bool_icon(getattr(ps, "bos", False))
     sweep_icon = "✓" if getattr(ps, "sweep_type", "none") != "none" or getattr(ps, "liquidity_sweep_score", 0.0) > 0 else "✗"
-    vol_icon = _bool_icon(getattr(ps, "volume_confirmed", False) or getattr(ps, "volume_spike", False))
     rsi_icon = _bool_icon(getattr(ps, "rsi", 50.0) < RSI_BUY_THRESHOLD)
     regime_label = str(getattr(ps, "regime", "normal")).replace("_", " ").title()
     decision = getattr(ps, "decision", "HOLD")
@@ -452,7 +446,7 @@ def _watch_block(ps, state) -> str:
     lines = [
         f"{ps.base_asset}/USDT — {_compact_price(ps.current_price)}",
         f"Regime: {regime_label} | Eff: {eff:.1f} / Th: {threshold:.1f} → {decision} {_decision_icon(decision)}",
-        f"Signals: BOS {bos_icon}  Sweep {sweep_icon}  Vol {vol_icon}  RSI {rsi_icon}",
+        f"Signals: BOS {bos_icon}  Sweep {sweep_icon}  RSI {rsi_icon}",
         f"OB: {ob:.2f} {_tri_icon(ob, OB_IMBALANCE_BULL, OB_IMBALANCE_BEAR)}  Flow: {flow:.2f} {_tri_icon(flow, OB_FLOW_BULL, OB_FLOW_BEAR)}",
         f"Trend: {getattr(ps, 'trend', 'chop').capitalize()} · Mode: {(getattr(ps, 'dynamic_params', None) or {}).get('trade_mode', 'RANGING')}  |  {status}",
     ]
@@ -579,7 +573,11 @@ def _futures_block_label(block_reason: str) -> str:
         "no_trend_alignment":         "not in downtrend",
         "weak_bearish_microstructure":"OB/flow not bearish",
         "no_downward_momentum":       "MACD not bearish",
-        "unfavorable_regime":         "regime blocks short",
+        "unfavorable_regime":         "regime blocks entry",
+        "no_bullish_trend":           "not in uptrend",
+        "weak_bullish_microstructure":"OB/flow not bullish",
+        "no_upward_momentum":         "MACD not bullish",
+        "triple_long_risk":           "triple-long risk",
         "low_score":                  "score too low",
         "max_positions":              "max positions",
     }
@@ -596,7 +594,8 @@ def _futures_paper_section(state) -> str:
     try:
         from futures_paper import (
             get_futures_open_positions, get_futures_unrealized_pnl,
-            get_futures_entry_block_reason, _futures_bearish_score,
+            get_futures_entry_block_reason,
+            _futures_bearish_score, _futures_bullish_score,
         )
         positions  = get_futures_open_positions(state)
         unrealized = get_futures_unrealized_pnl(state)
@@ -665,10 +664,21 @@ def _futures_paper_section(state) -> str:
                 ps = state.pairs.get(pair)
                 if ps is not None:
                     try:
-                        score = _futures_bearish_score(ps)
-                        block = get_futures_entry_block_reason(ps, fp_s, "short", score)
-                        block_str = _futures_block_label(block) if block else "READY ✓"
-                        lines.append(f"  {base:<6} ⚪  {block_str}  (score {score:.1f})")
+                        short_score = _futures_bearish_score(ps)
+                        short_block = get_futures_entry_block_reason(ps, fp_s, "short", short_score)
+                        long_score  = _futures_bullish_score(ps)
+                        long_block  = get_futures_entry_block_reason(ps, fp_s, "long",  long_score)
+                        if not short_block:
+                            block_str = "SHORT READY ✓"
+                            score_str = f"{short_score:.1f}"
+                        elif not long_block:
+                            block_str = "LONG READY ✓"
+                            score_str = f"{long_score:.1f}"
+                        else:
+                            # Show the less-blocked direction (prefer SHORT)
+                            block_str = f"S:{_futures_block_label(short_block)}"
+                            score_str = f"{short_score:.1f}"
+                        lines.append(f"  {base:<6} ⚪  {block_str}  (score {score_str})")
                     except Exception:
                         lines.append(f"  {base:<6} ⚪  —")
                 else:
@@ -840,13 +850,11 @@ def build_main_panel(state) -> discord.Embed:
 
         bos_icon   = _bool_icon(getattr(ps, "bos", False))
         sweep_icon = "✓" if getattr(ps, "sweep_type", "none") != "none" or getattr(ps, "liquidity_sweep_score", 0.0) > 0 else "✗"
-        vol_icon   = _bool_icon(getattr(ps, "volume_confirmed", False) or getattr(ps, "volume_spike", False))
         rsi_icon   = _bool_icon(getattr(ps, "rsi", 50.0) < RSI_BUY_THRESHOLD)
 
         reasons = []
         if bos_icon == "✓":   reasons.append("BOS")
         if sweep_icon == "✓": reasons.append("Sweep")
-        if vol_icon == "✓":   reasons.append("Vol")
         if rsi_icon == "✓":   reasons.append("RSI")
         if ob > OB_IMBALANCE_BULL:  reasons.append("OB")
         if flow > OB_FLOW_BULL:     reasons.append("Flow")
@@ -863,7 +871,7 @@ def build_main_panel(state) -> discord.Embed:
         lines = [
             f"{ps.base_asset}/USDT — {_format_price(ps.current_price)}",
             f"Regime: {str(getattr(ps, 'regime', 'normal')).replace('_', ' ').title()} | Eff: {eff:.1f} / Th: {threshold:.1f} → {ps.decision} {_decision_icon(ps.decision)}",
-            f"Signals: BOS {bos_icon}  Sweep {sweep_icon}  Vol {vol_icon}  RSI {rsi_icon}",
+            f"Signals: BOS {bos_icon}  Sweep {sweep_icon}  RSI {rsi_icon}",
             f"OB: {ob:.2f} {_tri_icon(ob, OB_IMBALANCE_BULL, OB_IMBALANCE_BEAR)}  Flow: {flow:.2f} {_tri_icon(flow, OB_FLOW_BULL, OB_FLOW_BEAR)}",
             f"Trend: {getattr(ps, 'trend', 'chop').capitalize()} · Mode: {(getattr(ps, 'dynamic_params', None) or {}).get('trade_mode', 'RANGING')}  |  Held: {held}",
             "",
@@ -958,9 +966,6 @@ def build_signals_embed(pair_state, bot_state) -> discord.Embed:
         f"\nRSI            {pair_state.rsi:.2f}"
         f"\nMACD           {pair_state.macd_crossover}"
         f"\nBollinger      {pair_state.bb_position}"
-        f"\nVolume         {'confirmed' if (pair_state.volume_confirmed or pair_state.volume_spike) else 'normal'}"
-        f"\nWhale          {pair_state.whale_signal}"
-        f"\nFear & Greed   {bot_state.fear_greed_score}"
         f"\nTrend          {pair_state.trend}"
         f"\nRegime         {pair_state.regime}"
         f"\nATR %          {pair_state.atr_pct * 100:.2f}%"
@@ -1115,18 +1120,13 @@ def build_config_embed(state) -> discord.Embed:
         f"\nReserve %           {PORTFOLIO_RESERVE_PCT * 100:.0f}%"
         f"\nMax positions       {PORTFOLIO_MAX_POSITIONS}"
         f"\nRSI Buy/Sell        {RSI_BUY_THRESHOLD} / {RSI_SELL_THRESHOLD}"
-        f"\nFear&Greed Max      {FEAR_GREED_BUY_MAX}"
         f"\nStop Loss           {STOP_LOSS_PCT}%"
         f"\nProfit Target       {PROFIT_TARGET_PCT}%"
         f"\nConfidence Buy      {CONFIDENCE_BUY_THRESHOLD}"
         f"\nTrade Size %        {TRADE_SIZE_PCT * 100:.0f}%"
         f"\nMax Position %      {MAX_POSITION_PCT * 100:.0f}%"
         f"\nRSI Interval        {INTERVAL_RSI}s"
-        f"\nCoinGecko Interval  {INTERVAL_COINGECKO}s"
-        f"\nWhale Interval      {INTERVAL_WHALE}s"
         f"\nEtherscan Interval  {INTERVAL_ETHERSCAN}s"
-        f"\nGoogleTrends Int    {INTERVAL_GOOGLE_TRENDS}s"
-        f"\nFear&Greed Int      {INTERVAL_FEAR_GREED}s"
         f"\nDiscord Panel Int   {INTERVAL_DISCORD_PANEL}s"
         f"\nRebalance Int       {PORTFOLIO_REBALANCE_INTERVAL}s"
         "\n```"

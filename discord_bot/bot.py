@@ -235,6 +235,10 @@ class TradingDiscordBot(discord.Client):
                     f"Panel rate limited — backing off {retry_after:.1f}s "
                     f"(resumes in ~{retry_after:.0f}s)"
                 )
+            elif e.status in (500, 502, 503, 504):
+                # Discord-side transient error — back off 30 s and retry silently
+                self._rate_limit_until = now + 30.0
+                logger.warning(f"Panel refresh skipped: Discord {e.status} (backing off 30s)")
             else:
                 logger.error(f"Panel refresh HTTP error: {e}")
         except Exception as e:

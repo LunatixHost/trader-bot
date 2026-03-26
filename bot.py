@@ -27,14 +27,12 @@ from datetime import datetime, timezone, timedelta
 from config import (
     USE_TESTNET, TRADING_PAIRS,
     BINANCE_API_KEY, BINANCE_SECRET_KEY, DISCORD_BOT_TOKEN,
-    INTERVAL_RSI, INTERVAL_COINGECKO, INTERVAL_WHALE,
-    INTERVAL_ETHERSCAN, INTERVAL_ORDERBOOK,
-    INTERVAL_GOOGLE_TRENDS, INTERVAL_FEAR_GREED,
+    INTERVAL_RSI, INTERVAL_ETHERSCAN, INTERVAL_ORDERBOOK,
     INTERVAL_DISCORD_PANEL, INTERVAL_PORTFOLIO_SNAPSHOT,
     INTERVAL_FVG,
     PORTFOLIO_REBALANCE_INTERVAL, PORTFOLIO_RESERVE_PCT, STOP_LOSS_PCT,
     TRADE_SIZE_PCT, MAX_POSITION_PCT, PROFIT_TARGET_PCT,
-    WHALE_ALERT_COINS, ETHERSCAN_COINS,
+    ETHERSCAN_COINS,
     USE_ATR_EXITS, ATR_TRAILING_MULTIPLIER, ATR_TP_MULTIPLIER,
     ATR_MAX_TRAIL_PCT, ATR_TRAIL_ACTIVATION_PCT,
     DRAWDOWN_TRIGGER_PCT, TRADE_COOLDOWN_SECONDS, TRADE_COOLDOWN_TRENDING,
@@ -71,12 +69,7 @@ from portfolio import (
 from logger import init_db, log_trade, save_portfolio_snapshot
 from signal_weights import compute_signal_weights
 from signals.rsi import fetch_technical_indicators
-from signals.fear_greed import fetch_fear_greed
-from signals.coingecko import fetch_coingecko
-from signals.whale_alert import fetch_whale_signal
 from signals.etherscan import fetch_etherscan
-# from signals.cryptocompare import fetch_social_stats  # removed: social_score unused by strategy
-from signals.google_trends import fetch_google_trend
 from signals.orderbook import fetch_orderbook_signals
 
 # ─── ANSI Color Codes ────────────────────────────────────────────────
@@ -309,51 +302,6 @@ async def poll_fvg(pair: str, initial_delay: float = 0):
         await asyncio.sleep(INTERVAL_FVG)
 
 
-async def poll_fear_greed():
-    """Poll Fear & Greed Index (market-wide, shared across all pairs)."""
-    while True:
-        try:
-            result = await fetch_fear_greed()
-            async with state.lock:
-                state.fear_greed_score = result["score"]
-                state.fear_greed_label = result["label"]
-        except Exception as e:
-            log.error(f"Fear & Greed poll error: {e}")
-        await asyncio.sleep(INTERVAL_FEAR_GREED)
-
-
-async def poll_coingecko(pair: str, initial_delay: float = 0):
-    """Poll CoinGecko volume data for a pair."""
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    base = get_base_asset(pair)
-    while True:
-        try:
-            result = await fetch_coingecko(base)
-            async with state.lock:
-                ps = state.pairs[pair]
-                ps.volume_spike = result["volume_spike"]
-                ps.volume_confirmed = result["volume_spike"]  # volume_confirmed = volume spike flag
-                ps.coingecko_change_pct = result["change_pct_24h"]
-        except Exception as e:
-            log.error(f"CoinGecko poll error for {pair}: {e}")
-        await asyncio.sleep(INTERVAL_COINGECKO)
-
-
-async def poll_whale(pair: str):
-    """Poll whale detection for a pair (only supported coins)."""
-    base = get_base_asset(pair)
-    if base not in WHALE_ALERT_COINS:
-        return  # Exit task immediately for unsupported coins
-    while True:
-        try:
-            price = state.pairs[pair].current_price
-            result = await fetch_whale_signal(base, current_price=price)
-            async with state.lock:
-                state.pairs[pair].whale_signal = result
-        except Exception as e:
-            log.error(f"Whale detection poll error for {pair}: {e}")
-        await asyncio.sleep(INTERVAL_WHALE)
 
 
 async def poll_etherscan(pair: str):
@@ -371,26 +319,6 @@ async def poll_etherscan(pair: str):
         except Exception as e:
             log.error(f"Etherscan poll error: {e}")
         await asyncio.sleep(INTERVAL_ETHERSCAN)
-
-
-    # NOTE: CryptoCompare social polling removed — social_score was never used
-    # by the strategy engine. The poll ran every 5 min × 6 pairs = 72 API calls/hr
-    # for data that was written to state but never read by any decision logic.
-
-
-async def poll_google_trends(pair: str, initial_delay: float = 0):
-    """Poll Google Trends for a pair."""
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    base = get_base_asset(pair)
-    while True:
-        try:
-            result = await fetch_google_trend(base)
-            async with state.lock:
-                state.pairs[pair].google_trend = result
-        except Exception as e:
-            log.error(f"Google Trends poll error for {pair}: {e}")
-        await asyncio.sleep(INTERVAL_GOOGLE_TRENDS)
 
 
 async def poll_orderbook(pair: str):
@@ -876,8 +804,6 @@ async def evaluate_and_trade(pair: str):
         base = ps.base_asset
         price = ps.current_price
         rsi = ps.rsi
-        fg = state.fear_greed_score
-        whale = ps.whale_signal[:6] if ps.whale_signal else "n/a"
         regime = ps.regime
         conf_w = ps.confidence_weighted
         atr_pct = ps.atr_pct
@@ -907,7 +833,7 @@ async def evaluate_and_trade(pair: str):
 
     log.info(
         f"{C.BOLD}{C.WHITE}{base:<5}{C.RESET} ${price:<12,.2f} | "
-        f"RSI {rsi_str} | F&G {fg:<3} | Whale: {whale:<8} | "
+        f"RSI {rsi_str} | "
         f"raw={C.CYAN}{conf_w:.1f}{C.RESET} eff={C.CYAN}{eff_score:.1f}{C.RESET}/{eff_threshold:.1f} | "
         f"{r_color}{regime[:5]}{C.RESET} ATR:{atr_pct:.3%} | -> {dec_color}"
     )
@@ -1046,9 +972,8 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
                 if ob_ok and flow_ok:
                     rsi_sig_fvg = 1.0 if ps.rsi < RSI_BUY_THRESHOLD else 0.0
                     bb_sig_fvg = 1.0 if ps.bb_position == "below_lower" else 0.0
-                    vol_sig_fvg = 1.0 if ps.volume_spike else 0.0
                     fast_score_fvg = (
-                        rsi_sig_fvg + bb_sig_fvg + vol_sig_fvg
+                        rsi_sig_fvg + bb_sig_fvg
                         + getattr(ps, "liquidity_sweep_score", 0.0)
                     )
 
@@ -1127,8 +1052,7 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
     log_trade(
         pair=pair, action="BUY", coin_price=avg_price,
         amount_coin=filled_qty, amount_usdt=filled_usdt,
-        rsi=ps.rsi, fear_greed=state.fear_greed_score,
-        whale_signal=ps.whale_signal, confidence=ps.confidence_score,
+        rsi=ps.rsi, confidence=ps.confidence_score,
         signal_snapshot=signal_snapshot,
         regime_at_entry=ps.regime,
         atr_value=ps.atr,
@@ -1275,8 +1199,7 @@ async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None =
     log_trade(
         pair=pair, action=action_label, coin_price=avg_price,
         amount_coin=filled_qty, amount_usdt=filled_usdt,
-        rsi=ps.rsi, fear_greed=state.fear_greed_score,
-        whale_signal=ps.whale_signal, confidence=ps.confidence_score,
+        rsi=ps.rsi, confidence=ps.confidence_score,
         pl_usdt=pl, note=note,
         signal_snapshot=signal_snapshot,
         regime_at_entry=ps.regime,
@@ -1695,8 +1618,7 @@ async def execute_long_term_buy(pair: str):
     log_trade(
         pair=pair, action="LT_BUY", coin_price=avg_price,
         amount_coin=filled_qty, amount_usdt=filled_usdt,
-        rsi=ps.rsi, fear_greed=state.fear_greed_score,
-        whale_signal=ps.whale_signal, confidence=ps.confidence_score,
+        rsi=ps.rsi, confidence=ps.confidence_score,
         pl_usdt=0.0, note="long_term",
         signal_snapshot=None,
         regime_at_entry=ps.regime, atr_value=ps.atr,
@@ -1768,8 +1690,7 @@ async def execute_long_term_sell(pair: str, reason: str = "LT_SELL"):
     log_trade(
         pair=pair, action=reason, coin_price=avg_price,
         amount_coin=filled_qty, amount_usdt=filled_usdt,
-        rsi=ps.rsi, fear_greed=state.fear_greed_score,
-        whale_signal=ps.whale_signal, confidence=ps.confidence_score,
+        rsi=ps.rsi, confidence=ps.confidence_score,
         pl_usdt=pl, note="long_term",
         signal_snapshot=None,
         regime_at_entry=ps.regime, atr_value=ps.atr,
@@ -1992,17 +1913,10 @@ async def start():
     for i, pair_cfg in enumerate(TRADING_PAIRS):
         pair = pair_cfg["pair"]
         stagger = i * 5  # 5 seconds between each pair's first poll
-        tasks.append(asyncio.create_task(poll_rsi(pair)))  # RSI uses Binance (no rate issue)
+        tasks.append(asyncio.create_task(poll_rsi(pair)))
         tasks.append(asyncio.create_task(poll_orderbook(pair)))
-        tasks.append(asyncio.create_task(poll_coingecko(pair, initial_delay=stagger + 2)))
-        tasks.append(asyncio.create_task(poll_whale(pair)))
         tasks.append(asyncio.create_task(poll_etherscan(pair)))
-        # poll_cryptocompare removed — social_score was unused by strategy
-        tasks.append(asyncio.create_task(poll_google_trends(pair, initial_delay=stagger + 10)))
         tasks.append(asyncio.create_task(poll_fvg(pair, initial_delay=stagger + 15)))
-
-    # Market-wide signal tasks
-    tasks.append(asyncio.create_task(poll_fear_greed()))
 
     # Portfolio management tasks
     tasks.append(asyncio.create_task(portfolio_rebalance_loop()))

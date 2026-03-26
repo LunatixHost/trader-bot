@@ -2,12 +2,11 @@ import logging
 from config import (
     RSI_BUY_THRESHOLD,
     RSI_SELL_THRESHOLD,
-    FEAR_GREED_BUY_MAX,
     CONFIDENCE_BUY_THRESHOLD,
-    WHALE_ALERT_COINS,
     ETHERSCAN_COINS,
     SIGNAL_CATEGORY_CAPS,
     REGIME_MODIFIERS,
+    REGIME_SIGNAL_MODIFIERS,
     DRAWDOWN_THRESHOLD_BOOST,
     BTC_CRASH_THRESHOLD_BOOST,
     NO_TRADE_ATR_PCT,
@@ -34,24 +33,11 @@ def _get_raw_signals(pair_state, bot_state):
     signals["rsi"] = 1.0 if pair_state.rsi < RSI_BUY_THRESHOLD else 0.0
     signals["bollinger"] = 1.0 if pair_state.bb_position == "below_lower" else 0.0
     signals["macd"] = 1.0 if pair_state.macd_crossover == "bullish" else 0.0
-    signals["trends"] = 1.0 if pair_state.google_trend > 50 else 0.0
-    signals["volume"] = 1.0 if pair_state.volume_spike else 0.0
-
-    signals["whale"] = (
-        1.0
-        if (base in WHALE_ALERT_COINS and pair_state.whale_signal in ("neutral", "accumulation"))
-        else 0.0
-    )
     signals["gas"] = (
         1.0
         if (base in ETHERSCAN_COINS and pair_state.etherscan_activity == "high")
         else 0.0
     )
-
-    if bot_state.fear_greed_score <= FEAR_GREED_BUY_MAX:
-        signals["fear_greed"] = 1.0 - (bot_state.fear_greed_score / 100.0)
-    else:
-        signals["fear_greed"] = 0.0
 
     return signals, signals.copy()
 
@@ -60,11 +46,7 @@ SIGNAL_CATEGORIES = {
     "rsi": "mean_reversion",
     "bollinger": "mean_reversion",
     "macd": "momentum",
-    "trends": "momentum",
-    "volume": "sentiment",
-    "whale": "onchain",
     "gas": "onchain",
-    "fear_greed": "macro",
 }
 
 
@@ -72,9 +54,9 @@ def calculate_confidence(pair_state, bot_state):
     signals, snapshot = _get_raw_signals(pair_state, bot_state)
 
     weights = bot_state.signal_weights
-    regime_mods = REGIME_MODIFIERS.get(
-        pair_state.regime, REGIME_MODIFIERS["ranging"]
-    )
+    regime = pair_state.regime
+    regime_mods = REGIME_MODIFIERS.get(regime, REGIME_MODIFIERS["ranging"])
+    signal_mods = REGIME_SIGNAL_MODIFIERS.get(regime, {})
 
     category_scores = {cat: 0.0 for cat in SIGNAL_CATEGORY_CAPS}
 
@@ -86,12 +68,17 @@ def calculate_confidence(pair_state, bot_state):
         if not cat:
             continue
 
+        # Learned reliability weight
         weight = weights.get(name, 1.0)
         if name == "macd":
             weight *= 0.5
 
-        mod = regime_mods.get(cat, 1.0)
-        category_scores[cat] += value * weight * mod
+        # Category-level regime modifier (e.g. momentum × 1.4 in trending)
+        cat_mod = regime_mods.get(cat, 1.0)
+        # Signal-level regime modifier (e.g. rsi × 0.8 in trending — RSI fights trend)
+        sig_mod = signal_mods.get(name, 1.0)
+
+        category_scores[cat] += value * weight * cat_mod * sig_mod
 
     total = sum(
         min(category_scores[c], SIGNAL_CATEGORY_CAPS[c])

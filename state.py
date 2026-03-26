@@ -85,13 +85,8 @@ class PairState:
     bb_squeeze: bool = False
 
     # Other signals
-    volume_spike: bool = False
-    coingecko_change_pct: float = 0.0
-    whale_signal: str = "neutral"       # "sell_pressure" | "accumulation" | "neutral"
     etherscan_gas: int = 0              # ETH only; 0 for others
     etherscan_activity: str = "normal"  # "high" | "normal" | "low"
-    social_score: int = 0
-    google_trend: int = 0
 
     # Strategy
     confidence_score: int = 0
@@ -136,8 +131,6 @@ class PairState:
     trend: str = "chop"                # "uptrend" | "downtrend" | "chop"
     bos: bool = False                  # Break of structure flag
     sweep_type: str = "none"           # "bearish" | "bullish" | "none"
-    volume_confirmed: bool = False     # True when volume > 1.5× average
-
     # Volatility signals
     volatility_score: float = 0.0
     volatility_regime: str = "normal" # "expansion" | "normal"
@@ -199,9 +192,6 @@ class PairState:
 class BotState:
     """Global bot state shared across all modules."""
 
-    # Market-wide signals
-    fear_greed_score: int = 50
-    fear_greed_label: str = "Neutral"
     is_paused: bool = False
     bot_uptime_start: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -250,17 +240,12 @@ class BotState:
 
     # Learned signal weights (loaded from signal_weights.py)
     signal_weights: dict = field(default_factory=lambda: {
-        "rsi": 1.0, "macd": 1.0, "bollinger": 1.0,
-        "fear_greed": 1.0, "volume": 1.0,
-        "whale": 1.0, "gas": 1.0,
-        "trends": 1.0,
+        "rsi": 1.0, "macd": 1.0, "bollinger": 1.0, "gas": 1.0,
     })
 
     def to_dict(self) -> dict:
         """Serialize global state (excluding pairs and lock) for DB."""
         return {
-            "fear_greed_score": self.fear_greed_score,
-            "fear_greed_label": self.fear_greed_label,
             "is_paused": self.is_paused,
             "bot_uptime_start": self.bot_uptime_start.isoformat(),
             "portfolio_total_usdt": self.portfolio_total_usdt,
@@ -385,8 +370,6 @@ def load_state_from_db() -> BotState | None:
         state = BotState()
 
         # Restore global fields
-        state.fear_greed_score = global_data.get("fear_greed_score", 50)
-        state.fear_greed_label = global_data.get("fear_greed_label", "Neutral")
         state.is_paused = global_data.get("is_paused", False)
         state.portfolio_total_usdt = global_data.get("portfolio_total_usdt", 0.0)
         state.usdt_balance = global_data.get("usdt_balance", 0.0)
@@ -404,13 +387,10 @@ def load_state_from_db() -> BotState | None:
         state.drawdown_pct = global_data.get("drawdown_pct", 0.0)
         state.in_drawdown = global_data.get("in_drawdown", False)
         loaded_weights = global_data.get("signal_weights", {})
-        loaded_weights.pop("sentiment", None)  # strip legacy key from old DB rows
-        defaults = {
-            "rsi": 1.0, "macd": 1.0, "bollinger": 1.0,
-            "fear_greed": 1.0, "volume": 1.0,
-            "whale": 1.0, "gas": 1.0,
-            "trends": 1.0,
-        }
+        # Strip any legacy keys from old DB rows
+        for _legacy in ("sentiment", "fear_greed", "volume", "whale", "trends"):
+            loaded_weights.pop(_legacy, None)
+        defaults = {"rsi": 1.0, "macd": 1.0, "bollinger": 1.0, "gas": 1.0}
         defaults.update(loaded_weights)
         state.signal_weights = defaults
 

@@ -94,12 +94,8 @@ def _serialize_pair(ps) -> dict:
         "bb_position": ps.bb_position,
         "bb_squeeze": ps.bb_squeeze,
         # Signals
-        "volume_spike": ps.volume_spike,
-        "whale_signal": ps.whale_signal,
         "etherscan_gas": ps.etherscan_gas,
         "etherscan_activity": ps.etherscan_activity,
-        "social_score": ps.social_score,
-        "google_trend": ps.google_trend,
         # Strategy
         "confidence": ps.confidence_score,
         "confidence_weighted": round(ps.confidence_weighted, 2),
@@ -168,8 +164,6 @@ def _serialize_state() -> dict:
             "win_rate": win_rate,
         },
         "market": {
-            "fear_greed_score": _state.fear_greed_score,
-            "fear_greed_label": _state.fear_greed_label,
             "btc_crash_active": _state.btc_crash_active,
             "btc_crash_until": _state.btc_crash_until,
             "btc_15m_change_pct": _state.btc_15m_change_pct,

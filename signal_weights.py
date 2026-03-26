@@ -32,8 +32,7 @@ logger = logging.getLogger("trading_bot.signal_weights")
 
 # All tracked signal names (must match keys in signal_snapshot JSON)
 SIGNAL_NAMES = [
-    "rsi", "macd", "bollinger", "fear_greed",
-    "volume", "whale", "gas", "trends",
+    "rsi", "macd", "bollinger", "gas",
 ]
 
 # Outcome scores: how much each outcome type contributes to a signal's score

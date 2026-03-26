@@ -34,6 +34,11 @@ from config import (
     FUTURES_POSITION_SIZE_USDT,
     FUTURES_MAX_CONCURRENT_POSITIONS,
     FUTURES_MIN_SCORE,
+    FUTURES_MIN_SCORE_RANGING,
+    FUTURES_MIN_SCORE_VOLATILE,
+    FUTURES_ATR_SIZING_ENABLED,
+    FUTURES_RISK_PCT_PER_TRADE,
+    FUTURES_ATR_STOP_MULT,
     FUTURES_TP1_PCT,
     FUTURES_TP1_RATIO,
     FUTURES_HARD_STOP_PCT,
@@ -52,9 +57,15 @@ from config import (
     FUTURES_OB_BEAR_MAX,
     FUTURES_FLOW_BEAR_MAX,
     FUTURES_MACD_HISTOGRAM_MAX,
+    FUTURES_OB_BULL_MIN,
+    FUTURES_FLOW_BULL_MIN,
+    FUTURES_TRIPLE_LONG_BLOCK,
     RSI_SELL_THRESHOLD,
+    RSI_BUY_THRESHOLD,
     OB_IMBALANCE_BEAR,
     OB_FLOW_BEAR,
+    OB_IMBALANCE_BULL,
+    OB_FLOW_BULL,
     TRADING_PAIRS,
 )
 from state import FuturesPaperState
@@ -166,27 +177,82 @@ def _compute_futures_pnl_pct(fp: FuturesPaperState, current_price: float) -> flo
         return (current_price - fp.entry_price) / fp.entry_price * 100.0 * fp.leverage
 
 
+def _futures_bullish_score(ps) -> float:
+    """Compute a bullish signal score for a LONG entry.
+
+    Mirror of _futures_bearish_score() — inverted direction:
+      - positive structure_score = bullish PA
+      - RSI oversold (bounce setup)
+      - bullish MACD crossover
+      - OB imbalance above bull threshold (buyers stacking)
+      - flow ratio above bull threshold (buyers lifting asks)
+
+    Max possible: ~4.0. Minimum for LONG entry: FUTURES_MIN_SCORE (1.5).
+    """
+    score = 0.0
+
+    struct = float(getattr(ps, "structure_score", 0.0))
+    if struct > 0:
+        score += min(struct, 1.5)
+
+    rsi = float(getattr(ps, "rsi", 50.0))
+    if rsi < RSI_BUY_THRESHOLD:
+        score += 0.8
+
+    if getattr(ps, "macd_crossover", "none") == "bullish":
+        score += 0.6
+
+    ob = float(getattr(ps, "orderbook_imbalance", 0.5))
+    if ob > OB_IMBALANCE_BULL:
+        score += 0.5
+
+    flow = float(getattr(ps, "flow_ratio", 0.5))
+    if flow > OB_FLOW_BULL:
+        score += 0.5
+
+    return score
+
+
+def _dynamic_futures_min_score(ps) -> float:
+    """Return the regime-adjusted minimum score required for a futures entry.
+
+    Priority 1 — Volatility-Adjusted Gate:
+      ranging         → FUTURES_MIN_SCORE_RANGING (1.2) — quiet market, score hard to reach at 1.5
+      trending        → FUTURES_MIN_SCORE          (1.5) — baseline, moderate ATR
+      choppy_volatile → FUTURES_MIN_SCORE_VOLATILE (1.8) — noisy; require stronger conviction
+      trending_volatile→ FUTURES_MIN_SCORE_VOLATILE(1.8) — fast moves; weak signals get stopped out
+
+    Using ATR regime (already computed per pair) avoids any extra indicator fetch.
+    """
+    regime = getattr(ps, "regime", "trending")
+    if regime == "ranging":
+        return FUTURES_MIN_SCORE_RANGING
+    if regime in {"choppy_volatile", "trending_volatile"}:
+        return FUTURES_MIN_SCORE_VOLATILE
+    return FUTURES_MIN_SCORE  # trending or unknown → baseline
+
+
 # ─── Entry gate ─────────────────────────────────────────────────────────────
 
-def get_futures_entry_block_reason(ps, fp: FuturesPaperState, side: str, bearish_score: float) -> str | None:
+def get_futures_entry_block_reason(ps, fp: FuturesPaperState, side: str, score: float) -> str | None:
     """Return a block reason string if a futures entry should be rejected, else None.
 
     Checks (in priority order):
-      1.  Module disabled
-      2.  Side disabled
-      3.  Position already open
-      4.  ATR uneconomic (expected move below cost assumption)
-      5.  Re-entry cooldown after failed exit
-      6.  Unstable / volatile candle
-      7.  Trend alignment (downtrend required for SHORT)
-      8.  Bearish microstructure confirmation (OB + flow both bearish)
-      9.  Momentum confirmation (MACD histogram must be negative)
-      10. Bearish score too low
-      11. Max concurrent positions
+      1.  Module disabled / side disabled
+      2.  Position already open on this symbol
+      3.  ATR uneconomic
+      4.  Re-entry cooldown
+      5.  Unstable candle
+      6.  Trend alignment (downtrend for SHORT, uptrend for LONG)
+      7.  Regime bias filter
+      8.  Triple-long safety (LONG only)
+      9.  Microstructure confirmation (directional)
+      10. Momentum confirmation (MACD histogram direction)
+      11. Score gate
+      12. Max concurrent positions
     """
     if not FUTURES_PAPER_ENABLED:
         return "futures_disabled"
-
     if side == "short" and not FUTURES_SHORT_ENABLED:
         return "short_disabled"
     if side == "long" and not FUTURES_LONG_ENABLED:
@@ -218,42 +284,55 @@ def get_futures_entry_block_reason(ps, fp: FuturesPaperState, side: str, bearish
         except Exception:
             pass
 
-    # Unstable candle: last candle range too large relative to ATR
+    # Unstable candle
     candle_range_pct = float(getattr(ps, "candle_range_pct", 0.0))
     if atr_pct > 0 and candle_range_pct > atr_pct * 2.5:
         return "unstable_candle"
 
-    # ── Directional alignment: only SHORT into confirmed downtrend ──────────
-    # Prevents reversal-guessing in choppy or ranging conditions.
-    if side == "short" and getattr(ps, "trend", "chop") != "downtrend":
-        return "no_trend_alignment"
-
-    # ── Regime-based bias filter ─────────────────────────────────────────────
-    # Block SHORTs during macro uptrend regimes — "death by a thousand stops"
-    # when shorting into a trending_volatile upswing.
+    trend  = getattr(ps, "trend", "chop")
     regime = getattr(ps, "regime", "ranging")
-    _SHORT_FORBIDDEN_REGIMES = {"trending_volatile"}   # strong trending with high vol = dangerous to short
-    if side == "short" and regime in _SHORT_FORBIDDEN_REGIMES:
-        return "unfavorable_regime"
-
-    # ── Microstructure confirmation (hard block, not penalty) ───────────────
-    # Both OB imbalance AND flow ratio must be bearish.
-    # A single weak signal is insufficient — we require both sellers and
-    # aggressive sell-flow to confirm the move is real.
-    ob   = float(getattr(ps, "orderbook_imbalance", 0.5))
-    flow = float(getattr(ps, "flow_ratio", 0.5))
-    if not (ob < FUTURES_OB_BEAR_MAX and flow < FUTURES_FLOW_BEAR_MAX):
-        return "weak_bearish_microstructure"
-
-    # ── Momentum confirmation (hard block) ──────────────────────────────────
-    # MACD histogram must be negative — confirms bearish momentum is already
-    # present, not just anticipated.  Prevents shorting before the move begins.
+    ob     = float(getattr(ps, "orderbook_imbalance", 0.5))
+    flow   = float(getattr(ps, "flow_ratio", 0.5))
     macd_hist = float(getattr(ps, "macd_histogram", 0.0))
-    if macd_hist >= FUTURES_MACD_HISTOGRAM_MAX:
-        return "no_downward_momentum"
 
-    # Score gate
-    if bearish_score < FUTURES_MIN_SCORE:
+    if side == "short":
+        # ── SHORT-specific gates ─────────────────────────────────────────────
+        if trend != "downtrend":
+            return "no_trend_alignment"
+        # Block SHORTs during trending_volatile — high-velocity upswings crush shorts
+        if regime in {"trending_volatile"}:
+            return "unfavorable_regime"
+        # Microstructure: both OB and flow must confirm selling pressure
+        if not (ob < FUTURES_OB_BEAR_MAX and flow < FUTURES_FLOW_BEAR_MAX):
+            return "weak_bearish_microstructure"
+        # Momentum: MACD histogram must already be negative
+        if macd_hist >= FUTURES_MACD_HISTOGRAM_MAX:
+            return "no_downward_momentum"
+
+    else:  # long
+        # ── LONG-specific gates ──────────────────────────────────────────────
+        if trend != "uptrend":
+            return "no_bullish_trend"
+        # Block LONGs in choppy_volatile — no clean directional edge
+        if regime in {"choppy_volatile"}:
+            return "unfavorable_regime"
+        # Triple-long safety: block if spot scalp AND long-term both holding same coin
+        if FUTURES_TRIPLE_LONG_BLOCK and _state is not None:
+            pair_key = getattr(ps, "pair", "")
+            spot_holding = float(getattr(ps, "asset_balance", 0.0)) > 0
+            lt_holding   = getattr(_state.long_term_states.get(pair_key), "holding", False)
+            if spot_holding and lt_holding:
+                return "triple_long_risk"
+        # Microstructure: both OB and flow must confirm buying pressure
+        if not (ob > FUTURES_OB_BULL_MIN and flow > FUTURES_FLOW_BULL_MIN):
+            return "weak_bullish_microstructure"
+        # Momentum: MACD histogram must be positive (upward momentum confirmed)
+        if macd_hist <= FUTURES_MACD_HISTOGRAM_MAX:
+            return "no_upward_momentum"
+
+    # Score gate — regime-adjusted minimum (Priority 1: volatility-adjusted gate)
+    min_score = _dynamic_futures_min_score(ps)
+    if score < min_score:
         return "low_score"
 
     # Concurrent position cap
@@ -262,6 +341,59 @@ def get_futures_entry_block_reason(ps, fp: FuturesPaperState, side: str, bearish
         return "max_positions"
 
     return None
+
+
+def _all_futures_block_reasons(ps, fp: FuturesPaperState, side: str, score: float) -> list[str]:
+    """Diagnostic helper — returns ALL block reasons that would fire, not just the first.
+
+    Does NOT short-circuit.  Used only for debug logging so you can see which
+    downstream gates would also block even when an upstream gate fires first.
+    Never used in actual entry decisions.
+    """
+    reasons = []
+
+    atr_pct = float(getattr(ps, "atr_pct", 0.0))
+    if atr_pct > 0:
+        expected_reward = atr_pct * FUTURES_ATR_UNECONOMIC_MULT * 100
+        if expected_reward < FUTURES_ROUND_TRIP_COST_PCT:
+            reasons.append("uneconomic_move")
+        elif expected_reward < FUTURES_MIN_REWARD_PCT:
+            reasons.append("low_reward")
+
+    trend  = getattr(ps, "trend", "chop")
+    regime = getattr(ps, "regime", "ranging")
+    ob     = float(getattr(ps, "orderbook_imbalance", 0.5))
+    flow   = float(getattr(ps, "flow_ratio", 0.5))
+    macd_hist = float(getattr(ps, "macd_histogram", 0.0))
+
+    if side == "short":
+        if trend != "downtrend":
+            reasons.append("no_trend_alignment")
+        if regime in {"trending_volatile"}:
+            reasons.append("unfavorable_regime")
+        if not (ob < FUTURES_OB_BEAR_MAX and flow < FUTURES_FLOW_BEAR_MAX):
+            reasons.append("weak_bearish_microstructure")
+        if macd_hist >= FUTURES_MACD_HISTOGRAM_MAX:
+            reasons.append("no_downward_momentum")
+    else:  # long
+        if trend != "uptrend":
+            reasons.append("no_bullish_trend")
+        if regime in {"choppy_volatile"}:
+            reasons.append("unfavorable_regime")
+        if FUTURES_TRIPLE_LONG_BLOCK and _state is not None:
+            pair_key = getattr(ps, "pair", "")
+            if float(getattr(ps, "asset_balance", 0.0)) > 0 and \
+               getattr(_state.long_term_states.get(pair_key), "holding", False):
+                reasons.append("triple_long_risk")
+        if not (ob > FUTURES_OB_BULL_MIN and flow > FUTURES_FLOW_BULL_MIN):
+            reasons.append("weak_bullish_microstructure")
+        if macd_hist <= FUTURES_MACD_HISTOGRAM_MAX:
+            reasons.append("no_upward_momentum")
+
+    if score < _dynamic_futures_min_score(ps):
+        reasons.append("low_score")
+
+    return reasons
 
 
 # ─── Exit logic ─────────────────────────────────────────────────────────────
@@ -327,14 +459,13 @@ def _should_fire_futures_tp1(fp: FuturesPaperState, pnl_pct: float) -> bool:
 
 
 def _should_signal_exit_futures(fp: FuturesPaperState, ps, pnl_pct: float) -> bool:
-    """Return True if the bearish thesis has reversed and we should exit a SHORT.
+    """Return True if the directional thesis has reversed and we should exit.
 
-    For a SHORT, the thesis breaks when:
-      - MACD crosses back to bullish
-      - OB and flow both flip bullish (buyers returning)
-    Only fire if we're in profit or flat (don't use signal exit to cut a loss — hard_stop handles that).
+    For SHORT: exits when bearish thesis breaks (bullish reversal signals).
+    For LONG:  exits when bullish thesis breaks (bearish reversal signals).
+    Only fires in profit — hard_stop handles loss exits.
     """
-    if not fp.is_open or fp.side != "short":
+    if not fp.is_open:
         return False
 
     # Only use signal exit when in profit (avoid signal-selling a loser)
@@ -342,16 +473,22 @@ def _should_signal_exit_futures(fp: FuturesPaperState, ps, pnl_pct: float) -> bo
         return False
 
     macd_cross = getattr(ps, "macd_crossover", "none")
-    ob = float(getattr(ps, "orderbook_imbalance", 0.5))
+    ob   = float(getattr(ps, "orderbook_imbalance", 0.5))
     flow = float(getattr(ps, "flow_ratio", 0.5))
 
-    # Bullish MACD reversal
-    if macd_cross == "bullish":
-        return True
+    if fp.side == "short":
+        # Bearish thesis breaks on bullish reversal
+        if macd_cross == "bullish":
+            return True
+        if ob > 0.55 and flow > 0.55:
+            return True
 
-    # Both microstructure signals gone bullish
-    if ob > 0.55 and flow > 0.55:
-        return True
+    else:  # long
+        # Bullish thesis breaks on bearish reversal
+        if macd_cross == "bearish":
+            return True
+        if ob < 0.45 and flow < 0.45:
+            return True
 
     return False
 
@@ -375,7 +512,26 @@ def execute_futures_paper_entry(pair: str, ps, side: str = "short"):
 
     entry_price = current_price
     leverage    = FUTURES_MAX_LEVERAGE
-    notional    = FUTURES_POSITION_SIZE_USDT
+
+    # Priority 3 — ATR-Based Position Sizing:
+    # Size each position so the hard stop always costs exactly
+    # FUTURES_RISK_PCT_PER_TRADE % of total portfolio value.
+    # High ATR → wide stop → smaller position. Low ATR → tighter stop → larger position.
+    # Capped at FUTURES_POSITION_SIZE_USDT (max notional) and floored at $5 (no dust).
+    notional = FUTURES_POSITION_SIZE_USDT  # fallback
+    if FUTURES_ATR_SIZING_ENABLED and _state is not None:
+        atr_pct = float(getattr(ps, "atr_pct", 0.0))
+        portfolio_val = (
+            _state.portfolio_current_value
+            or _state.portfolio_total_usdt
+            or 0.0
+        )
+        if atr_pct > 0 and portfolio_val > 0:
+            dollar_risk  = portfolio_val * FUTURES_RISK_PCT_PER_TRADE
+            stop_pct     = atr_pct * FUTURES_ATR_STOP_MULT  # expected stop distance
+            atr_notional = dollar_risk / stop_pct
+            notional     = max(5.0, min(FUTURES_POSITION_SIZE_USDT, atr_notional))
+
     quantity    = notional / entry_price
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -405,7 +561,6 @@ def execute_futures_paper_entry(pair: str, ps, side: str = "short"):
         amount_coin=quantity,
         amount_usdt=notional,
         rsi=float(getattr(ps, "rsi", 0.0)),
-        fear_greed=int(getattr(getattr(ps, "_bot_state", None), "fear_greed_score", 0) if False else 0),
         confidence=0,
         pl_usdt=0.0,
         note=note,
@@ -599,17 +754,58 @@ def _evaluate_futures_short_entry(pair: str, ps):
     # Check entry gate — all hard blocks live here
     block = get_futures_entry_block_reason(ps, fp, "short", bearish_score)
     if block:
+        # Shadow-check: collect ALL gates that would block (not just the first)
+        # so the log shows the full picture even when an early gate fires first.
+        all_blocks = _all_futures_block_reasons(ps, fp, "short", bearish_score)
+        all_str = " | ".join(all_blocks) if all_blocks else block
         logger.debug(
             f"[FUTURES PAPER] {pair} SHORT blocked: {block}  "
-            f"(score={bearish_score:.2f} ob={getattr(ps,'orderbook_imbalance',0.5):.2f} "
+            f"all_blocks=[{all_str}]  "
+            f"score={bearish_score:.2f} "
+            f"atr={getattr(ps,'atr_pct',0.0)*100:.3f}% "
+            f"ob={getattr(ps,'orderbook_imbalance',0.5):.2f} "
             f"flow={getattr(ps,'flow_ratio',0.5):.2f} "
             f"macd_hist={getattr(ps,'macd_histogram',0.0):.6f} "
-            f"trend={getattr(ps,'trend','?')})"
+            f"trend={getattr(ps,'trend','?')} "
+            f"regime={getattr(ps,'regime','?')}"
         )
         return
 
     # Entry approved — open paper position
     execute_futures_paper_entry(pair, ps, side="short")
+
+
+def _evaluate_futures_long_entry(pair: str, ps):
+    """Evaluate whether to open a paper LONG on this pair.
+
+    Mirror of _evaluate_futures_short_entry() using bullish scoring and
+    uptrend-aligned gates.  Called each futures_paper_loop cycle for pairs
+    without an open position, when FUTURES_LONG_ENABLED is True.
+    """
+    fp = _state.futures_states.get(pair)
+    if fp is None:
+        return
+
+    bullish_score = _futures_bullish_score(ps)
+
+    block = get_futures_entry_block_reason(ps, fp, "long", bullish_score)
+    if block:
+        all_blocks = _all_futures_block_reasons(ps, fp, "long", bullish_score)
+        all_str = " | ".join(all_blocks) if all_blocks else block
+        logger.debug(
+            f"[FUTURES PAPER] {pair} LONG blocked: {block}  "
+            f"all_blocks=[{all_str}]  "
+            f"score={bullish_score:.2f} "
+            f"atr={getattr(ps,'atr_pct',0.0)*100:.3f}% "
+            f"ob={getattr(ps,'orderbook_imbalance',0.5):.2f} "
+            f"flow={getattr(ps,'flow_ratio',0.5):.2f} "
+            f"macd_hist={getattr(ps,'macd_histogram',0.0):.6f} "
+            f"trend={getattr(ps,'trend','?')} "
+            f"regime={getattr(ps,'regime','?')}"
+        )
+        return
+
+    execute_futures_paper_entry(pair, ps, side="long")
 
 
 def _evaluate_futures_exits(pair: str, ps):
@@ -690,9 +886,10 @@ def evaluate_and_trade_futures(pair: str):
     if fp.is_open:
         _evaluate_futures_exits(pair, ps)
     else:
-        # Only SHORT supported in v1; LONG would call _evaluate_futures_long_entry
         if FUTURES_SHORT_ENABLED:
             _evaluate_futures_short_entry(pair, ps)
+        if FUTURES_LONG_ENABLED and not fp.is_open:
+            _evaluate_futures_long_entry(pair, ps)
 
 
 # ─── Main loop ──────────────────────────────────────────────────────────────
