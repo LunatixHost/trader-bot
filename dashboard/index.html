@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Terminal</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<div class="terminal">
+
+    <!-- ─── Top Bar ─── -->
+    <header class="topbar">
+        <div class="tb-left">
+            <span class="tb-logo">TERMINAL</span>
+            <span class="tb-badge" id="mode-badge">TESTNET</span>
+            <span class="tb-dot" id="ws-dot"></span>
+        </div>
+        <div class="tb-right">
+            <span id="uptime" class="tb-meta">--</span>
+            <span id="clock" class="tb-meta"></span>
+        </div>
+    </header>
+
+    <!-- ─── Metrics Strip ─── -->
+    <div class="metrics-row">
+        <div class="m-cell">
+            <span class="m-label">PORTFOLIO</span>
+            <span class="m-val" id="m-portfolio">$--</span>
+            <span class="m-sub" id="m-portfolio-pl">--</span>
+        </div>
+        <div class="m-cell">
+            <span class="m-label">P/L</span>
+            <span class="m-val" id="m-pl">$--</span>
+            <span class="m-sub" id="m-pl-pct">--</span>
+        </div>
+        <div class="m-cell">
+            <span class="m-label">DRAWDOWN</span>
+            <span class="m-val" id="m-drawdown">--</span>
+            <span class="m-sub" id="m-peak">--</span>
+        </div>
+        <div class="m-cell">
+            <span class="m-label">WIN RATE</span>
+            <span class="m-val" id="m-winrate">--</span>
+            <span class="m-sub" id="m-trades">--</span>
+        </div>
+        <div class="m-cell">
+            <span class="m-label">FEAR &amp; GREED</span>
+            <span class="m-val" id="m-fg">--</span>
+            <span class="m-sub" id="m-fg-label">--</span>
+        </div>
+        <div class="m-cell">
+            <span class="m-label">BTC 15M</span>
+            <span class="m-val" id="m-btc-change">--</span>
+            <span class="m-sub" id="m-btc-crash">--</span>
+        </div>
+    </div>
+
+    <!-- ─── Canvas (floating windows) ─── -->
+    <div class="canvas" id="canvas">
+
+        <!-- Watchlist window -->
+        <div class="window" id="win-watchlist">
+            <div class="win-header" data-drag="win-watchlist">
+                <span class="win-title">WATCHLIST</span>
+                <div class="win-controls">
+                    <button class="win-btn" data-min="win-watchlist" title="Minimize">─</button>
+                </div>
+            </div>
+            <div class="win-body" id="pair-list"></div>
+            <div class="win-resize" data-resize="win-watchlist"></div>
+        </div>
+
+        <!-- Chart window -->
+        <div class="window" id="win-chart">
+            <div class="win-header" data-drag="win-chart">
+                <span class="win-title" id="chart-pair-label">SELECT PAIR</span>
+                <div class="ct-intervals" id="interval-btns">
+                    <button data-interval="5m">5m</button>
+                    <button data-interval="15m" class="active">15m</button>
+                    <button data-interval="1h">1h</button>
+                    <button data-interval="4h">4h</button>
+                    <button data-interval="1d">1d</button>
+                </div>
+                <div class="win-controls">
+                    <button class="win-btn" data-min="win-chart" title="Minimize">─</button>
+                </div>
+            </div>
+            <div class="win-body chart-body">
+                <div class="chart-wrap" id="chart-area"></div>
+            </div>
+            <div class="win-resize" data-resize="win-chart"></div>
+        </div>
+
+        <!-- Signals window -->
+        <div class="window" id="win-signals">
+            <div class="win-header" data-drag="win-signals">
+                <span class="win-title">SIGNALS</span>
+                <div class="win-controls">
+                    <button class="win-btn" data-min="win-signals" title="Minimize">─</button>
+                </div>
+            </div>
+            <div class="win-body" id="signal-bars"></div>
+            <div class="win-resize" data-resize="win-signals"></div>
+        </div>
+
+        <!-- Sidebar window -->
+        <div class="window" id="win-sidebar">
+            <div class="win-header" data-drag="win-sidebar">
+                <span class="win-title">INFO</span>
+                <div class="win-controls">
+                    <button class="win-btn" data-min="win-sidebar" title="Minimize">─</button>
+                </div>
+            </div>
+            <div class="win-body sidebar-body">
+                <nav class="sb-tabs">
+                    <button class="sb-tab active" data-tab="trades">Trades</button>
+                    <button class="sb-tab" data-tab="weights">Weights</button>
+                    <button class="sb-tab" data-tab="controls">Controls</button>
+                    <button class="sb-tab" data-tab="config">Config</button>
+                </nav>
+                <div class="sb-content">
+                    <div class="tab-pane active" id="tab-trades">
+                        <div id="trade-feed"></div>
+                    </div>
+                    <div class="tab-pane" id="tab-weights">
+                        <div id="weights-display"></div>
+                    </div>
+                    <div class="tab-pane" id="tab-controls">
+                        <div class="ctl-group">
+                            <h4>Bot Control</h4>
+                            <button class="ctl-btn" id="btn-pause">Pause Bot</button>
+                        </div>
+                        <div class="ctl-group">
+                            <h4>Buy Threshold</h4>
+                            <div class="ctl-inline">
+                                <input type="number" id="threshold-input" step="0.5" min="0" max="10" value="2.5">
+                                <button class="ctl-set" id="btn-threshold">Set</button>
+                            </div>
+                        </div>
+                        <div class="ctl-group">
+                            <h4>Emergency</h4>
+                            <button class="ctl-btn danger" id="btn-close-all">Close All Positions</button>
+                        </div>
+                    </div>
+                    <div class="tab-pane" id="tab-config">
+                        <div id="config-display"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="win-resize" data-resize="win-sidebar"></div>
+        </div>
+
+    </div><!-- /canvas -->
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
