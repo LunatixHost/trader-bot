@@ -54,6 +54,8 @@ from config import (
     FUTURES_MIN_REWARD_PCT,
     FUTURES_ATR_UNECONOMIC_MULT,
     FUTURES_CHECK_INTERVAL,
+    FUTURES_FUNDING_RATE_PCT,
+    FUTURES_FUNDING_INTERVAL_SECS,
     FUTURES_OB_BEAR_MAX,
     FUTURES_FLOW_BEAR_MAX,
     FUTURES_MACD_HISTOGRAM_MAX,
@@ -396,6 +398,46 @@ def _all_futures_block_reasons(ps, fp: FuturesPaperState, side: str, score: floa
     return reasons
 
 
+# ─── Funding fee simulation ──────────────────────────────────────────────────
+
+def _apply_simulated_funding(fp: FuturesPaperState) -> float:
+    """Apply accrued funding fees to an open paper position.
+
+    Called each evaluation cycle.  Only charges the fee when a full
+    FUTURES_FUNDING_INTERVAL_SECS (8 hours) has elapsed since the last charge,
+    matching Binance's actual 00:00 / 08:00 / 16:00 UTC settlement schedule.
+
+    Rate: FUTURES_FUNDING_RATE_PCT of notional per interval (both sides pay —
+    conservative assumption that keeps paper P&L honest regardless of direction).
+
+    Returns:
+        USD amount charged this call (0.0 if interval not yet elapsed).
+    """
+    if not fp.is_open or fp.notional_usdt <= 0:
+        return 0.0
+
+    now = time.monotonic()
+    # Initialise on first call after entry
+    if fp.last_funding_ts == 0.0:
+        fp.last_funding_ts = now
+        return 0.0
+
+    elapsed = now - fp.last_funding_ts
+    if elapsed < FUTURES_FUNDING_INTERVAL_SECS:
+        return 0.0  # Not yet time for next settlement
+
+    fee = fp.notional_usdt * (FUTURES_FUNDING_RATE_PCT / 100.0)
+    fp.accrued_funding_usdt += fee
+    fp.last_funding_ts = now
+
+    logger.info(
+        f"[FUTURES PAPER] FUNDING {fp.symbol} {fp.side.upper()}  "
+        f"-${fee:.4f} (total accrued: -${fp.accrued_funding_usdt:.4f}  "
+        f"notional=${fp.notional_usdt:.2f})"
+    )
+    return fee
+
+
 # ─── Exit logic ─────────────────────────────────────────────────────────────
 
 def _get_futures_forced_exit_reason(fp: FuturesPaperState, pnl_pct: float) -> str | None:
@@ -641,9 +683,13 @@ def execute_futures_paper_exit(pair: str, ps, reason: str):
     else:
         pl_usdt = (current_price - fp.entry_price) * fp.quantity * fp.leverage
 
-    # Apply paper round-trip cost assumption
+    # Apply paper round-trip cost (taker fees)
     cost_deduction = fp.notional_usdt * (FUTURES_ROUND_TRIP_COST_PCT / 100.0)
     pl_usdt -= cost_deduction
+
+    # Deduct all accrued funding fees ("rent" paid over the hold period)
+    funding_deduction = fp.accrued_funding_usdt
+    pl_usdt -= funding_deduction
 
     # Hold time
     held_min = 0.0
@@ -678,12 +724,15 @@ def execute_futures_paper_exit(pair: str, ps, reason: str):
     fp.peak_pnl_pct = 0.0
     fp.trailing_stop = 0.0
     fp.tp1_hit      = False
+    fp.accrued_funding_usdt = 0.0
+    fp.last_funding_ts = 0.0
     fp.last_action_ts = time.monotonic()
 
     note = (
         f"PAPER EXIT {reason} | "
         f"entry=${entry_price_snapshot:,.4f} → exit=${current_price:,.4f} | "
-        f"pnl={pnl_pct:+.2f}% | held={held_min:.1f}min"
+        f"pnl={pnl_pct:+.2f}% | fees=-${cost_deduction:.4f} | "
+        f"funding=-${funding_deduction:.4f} | held={held_min:.1f}min"
     )
 
     log_trade(
@@ -702,7 +751,8 @@ def execute_futures_paper_exit(pair: str, ps, reason: str):
     logger.info(
         f"[FUTURES PAPER] CLOSE {pair} ({reason})  "
         f"${entry_price_snapshot:,.4f} → ${current_price:,.4f}  "
-        f"pnl={pnl_pct:+.2f}%  pl={sign}${pl_usdt:.2f}  held={held_min:.1f}min"
+        f"pnl={pnl_pct:+.2f}%  fees=-${cost_deduction:.4f}  "
+        f"funding=-${funding_deduction:.4f}  net={sign}${pl_usdt:.2f}  held={held_min:.1f}min"
     )
 
 
@@ -826,6 +876,9 @@ def _evaluate_futures_exits(pair: str, ps):
     current_price = float(getattr(ps, "current_price", 0.0))
     if current_price <= 0:
         return
+
+    # Apply funding fee if interval has elapsed (8-hour settlement)
+    _apply_simulated_funding(fp)
 
     pnl_pct = _compute_futures_pnl_pct(fp, current_price)
 
@@ -981,19 +1034,20 @@ def get_futures_open_positions(state) -> list[dict]:
                 pass
 
         positions.append({
-            "pair":          pair,
-            "base":          pair.replace("USDT", ""),
-            "side":          fp.side,
-            "entry_price":   fp.entry_price,
-            "current_price": current_price,
-            "notional_usdt": fp.notional_usdt,
-            "leverage":      fp.leverage,
-            "pnl_pct":       pnl_pct,
-            "pl_usdt":       pl_usdt,
-            "tp1_hit":       fp.tp1_hit,
-            "trailing_stop": fp.trailing_stop,
-            "peak_pnl_pct":  fp.peak_pnl_pct,
-            "held_min":      held_min,
-            "entry_time":    fp.entry_time,
+            "pair":                 pair,
+            "base":                 pair.replace("USDT", ""),
+            "side":                 fp.side,
+            "entry_price":          fp.entry_price,
+            "current_price":        current_price,
+            "notional_usdt":        fp.notional_usdt,
+            "leverage":             fp.leverage,
+            "pnl_pct":              pnl_pct,
+            "pl_usdt":              pl_usdt,
+            "tp1_hit":              fp.tp1_hit,
+            "trailing_stop":        fp.trailing_stop,
+            "peak_pnl_pct":         fp.peak_pnl_pct,
+            "held_min":             held_min,
+            "entry_time":           fp.entry_time,
+            "accrued_funding_usdt": fp.accrued_funding_usdt,
         })
     return positions

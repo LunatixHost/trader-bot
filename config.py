@@ -258,10 +258,17 @@ FUTURES_STAGNATION_MINUTES_T2       = 15      # Hard stagnation exit time
 FUTURES_STAGNATION_THRESHOLD_T2     = 0.10    # Minimum % gain by T2 to avoid time-stop
 FUTURES_TIME_STOP_MINUTES           = 45      # Absolute max hold time (paper position)
 FUTURES_REENTRY_COOLDOWN_SECS       = 600     # Min gap before re-entering same symbol after failed exit
-FUTURES_ROUND_TRIP_COST_PCT         = 0.30    # Assumed cost for futures round-trip (fee + funding)
-FUTURES_MIN_REWARD_PCT              = 0.50    # Min expected reward after costs — raised 0.40→0.50 to ensure meaningful edge
+FUTURES_ROUND_TRIP_COST_PCT         = 0.30    # Assumed cost for futures round-trip (taker fees only)
+FUTURES_MIN_REWARD_PCT              = 0.50    # Min expected reward after costs
 FUTURES_ATR_UNECONOMIC_MULT         = 2.0     # Same as spot ATR_TP_MULTIPLIER for expected move calc
 FUTURES_CHECK_INTERVAL              = 15      # Evaluation loop interval (seconds)
+# ── Funding Fee Simulation ────────────────────────────────────────────────
+# Real Binance perpetual funding settles every 8 hours.
+# Typical rate: 0.01% per interval (positive = longs pay shorts).
+# We apply a symmetric cost to both sides (longs AND shorts pay) so paper
+# P&L reflects the true "rent" of holding a leveraged position.
+FUTURES_FUNDING_RATE_PCT            = 0.01    # 0.01% of notional per 8-hour interval
+FUTURES_FUNDING_INTERVAL_SECS       = 28800   # 8 hours in seconds
 # Entry quality filters (hard blocks — not penalties)
 FUTURES_OB_BEAR_MAX                 = 0.45    # OB imbalance must be BELOW this for SHORT confirmation
 FUTURES_FLOW_BEAR_MAX               = 0.45    # Flow ratio must be BELOW this for SHORT confirmation

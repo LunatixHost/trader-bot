@@ -642,11 +642,15 @@ def _futures_paper_section(state) -> str:
             trail     = pos["trailing_stop"]
             trail_str = f"${trail:,.4f}" if trail > 0 else "—"
             held_str  = f"{int(pos['held_min'])}m"
+            funding   = pos.get("accrued_funding_usdt", 0.0)
+            fund_str  = f"-${funding:.4f}" if funding > 0 else "none"
+            net_usdt  = pl_usdt - funding
             lines += [
-                f"{pos['base']:<6} {pos['side'].upper()}  {icon} {pnl_pct:+.2f}%  (${pl_usdt:+.2f})",
+                f"{pos['base']:<6} {pos['side'].upper()}  {icon} {pnl_pct:+.2f}%  gross ${pl_usdt:+.2f}  net ${net_usdt:+.2f}",
                 f"  Entry   ${pos['entry_price']:>12,.4f}  →  ${pos['current_price']:>12,.4f}",
                 f"  Lev     {pos['leverage']:.0f}×  |  Notional ${pos['notional_usdt']:.0f}",
                 f"  TP1     {tp1_str}  |  Trail {trail_str}  |  Held {held_str}",
+                f"  Funding {fund_str}",
                 "",
             ]
 

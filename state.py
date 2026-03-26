@@ -55,6 +55,8 @@ class FuturesPaperState:
     last_action_ts: float = 0.0      # Monotonic timestamp of last action
     last_failed_exit_reason: str = ""  # Most recent forced-exit reason (for cooldown)
     last_failed_exit_time: str = ""    # ISO timestamp of that exit
+    accrued_funding_usdt: float = 0.0  # Cumulative funding fees charged during this position
+    last_funding_ts: float = 0.0       # Monotonic timestamp of last funding application
 
     def to_dict(self) -> dict:
         return asdict(self)
