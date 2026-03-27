@@ -6,9 +6,7 @@ Tables:
 
 Signal snapshot JSON schema (stored per trade):
 {
-    "rsi": 0|1, "macd": 0|1, "bollinger": 0|1,
-    "fear_greed": 0.0-1.0, "volume": 0|1,
-    "whale": 0|1, "gas": 0|1, "trends": 0|1
+    "rsi": 0|1, "macd": 0|1, "bollinger": 0|1, "gas": 0|1
 }
 """
 
@@ -144,8 +142,6 @@ def log_trade(
     amount_coin: float,
     amount_usdt: float,
     rsi: float = 0.0,
-    fear_greed: int = 0,
-    whale_signal: str = "neutral",
     confidence: int = 0,
     pl_usdt: float = 0.0,
     note: str = "",
@@ -189,11 +185,11 @@ def log_trade(
         cursor = conn.execute(
             """INSERT INTO trades
                (timestamp, pair, action, coin_price, amount_coin, amount_usdt,
-                rsi, fear_greed, whale_signal, confidence,
+                rsi, confidence,
                 pl_usdt, note,
                 signal_snapshot, outcome_label, regime_at_entry,
                 atr_value, confidence_weighted, hold_minutes, entry_time)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 pair,
@@ -202,8 +198,6 @@ def log_trade(
                 amount_coin,
                 amount_usdt,
                 rsi,
-                fear_greed,
-                whale_signal,
                 confidence,
                 pl_usdt,
                 note,

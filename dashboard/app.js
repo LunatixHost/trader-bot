@@ -260,11 +260,6 @@ function renderMetrics(data) {
     setText('m-winrate', `${s.win_rate}%`);
     setText('m-trades', `${s.total_trades} (${s.profitable}W/${s.sells - s.profitable}L)`);
 
-    const fgCls = m.fear_greed_score <= 25 ? 'neg' : m.fear_greed_score <= 45 ? '' : 'pos';
-    const fg = document.getElementById('m-fg');
-    if (fg) { fg.textContent = m.fear_greed_score; fg.className = fgCls; }
-    setText('m-fg-label', m.fear_greed_label);
-
     setColor('m-btc-change', `${m.btc_15m_change_pct >= 0 ? '+' : ''}${m.btc_15m_change_pct.toFixed(2)}%`, m.btc_15m_change_pct >= 0);
     const crash = document.getElementById('m-btc-crash');
     if (crash) { crash.textContent = m.btc_crash_active ? 'CRASH MODE' : 'Normal'; crash.className = m.btc_crash_active ? 'neg' : 'neu'; }
@@ -468,15 +463,15 @@ document.querySelectorAll('#interval-btns button').forEach(btn => {
 
 // ─── Signal Panel ──────────────────────────────────────────────
 
-const SIG_CAT   = { rsi:'mean_reversion', bollinger:'mean_reversion', macd:'momentum', trends:'momentum', volume:'sentiment', whale:'onchain', gas:'onchain', fear_greed:'macro' };
-const CAT_COLOR = { mean_reversion:'var(--blue)', momentum:'var(--cyan)', sentiment:'var(--magenta)', onchain:'var(--yellow)', macro:'var(--green)' };
-const SIG_LABEL = { rsi:'RSI', bollinger:'BB', macd:'MACD', trends:'Trends', volume:'Vol', whale:'Whale', gas:'Gas', fear_greed:'F&G' };
+const SIG_CAT   = { rsi:'mean_reversion', bollinger:'mean_reversion', macd:'momentum', gas:'onchain' };
+const CAT_COLOR = { mean_reversion:'var(--blue)', momentum:'var(--cyan)', onchain:'var(--yellow)' };
+const SIG_LABEL = { rsi:'RSI', bollinger:'BB', macd:'MACD', gas:'Gas' };
 
 function renderSignalPanel(pd, weights) {
     const container = document.getElementById('signal-bars');
     if (!container) return;
 
-    const signals = ['rsi','macd','bollinger','fear_greed','volume','whale','gas','trends'];
+    const signals = ['rsi','macd','bollinger','gas'];
     let html = '';
 
     for (const name of signals) {
@@ -485,14 +480,10 @@ function renderSignalPanel(pd, weights) {
         let active = false, raw = '--';
 
         switch (name) {
-            case 'rsi':        active = pd.rsi < 35;                               raw = pd.rsi?.toFixed(0) ?? '--'; break;
-            case 'macd':       active = pd.macd_crossover === 'bullish';            raw = pd.macd_crossover || '--'; break;
-            case 'bollinger':  active = pd.bb_position === 'below_lower';           raw = pd.bb_position?.replace(/_/g,' ') || '--'; break;
-            case 'fear_greed': active = (state?.market?.fear_greed_score||50) <= 35; raw = state?.market?.fear_greed_score ?? '--'; break;
-            case 'volume':     active = !!pd.volume_spike;                          raw = active ? 'spike' : '-'; break;
-            case 'whale':      active = pd.whale_signal && pd.whale_signal !== 'sell_pressure'; raw = pd.whale_signal || '--'; break;
-            case 'gas':        active = pd.etherscan_gas > 0 && pd.etherscan_activity === 'high'; raw = pd.etherscan_gas || '-'; break;
-            case 'trends':     active = (pd.google_trend||0) > 50;                 raw = pd.google_trend ?? '--'; break;
+            case 'rsi':       active = pd.rsi < 35;                               raw = pd.rsi?.toFixed(0) ?? '--'; break;
+            case 'macd':      active = pd.macd_crossover === 'bullish';            raw = pd.macd_crossover || '--'; break;
+            case 'bollinger': active = pd.bb_position === 'below_lower';           raw = pd.bb_position?.replace(/_/g,' ') || '--'; break;
+            case 'gas':       active = pd.etherscan_gas > 0 && pd.etherscan_activity === 'high'; raw = pd.etherscan_gas || '-'; break;
         }
 
         const barW = Math.min(100, (weight / 1.5) * 100).toFixed(1);
