@@ -100,18 +100,25 @@ def _manual_bbands(
 
 # ─── Main Function ────────────────────────────────────────────────────
 
-async def fetch_technical_indicators(binance_client, pair: str) -> dict:
+async def fetch_technical_indicators(
+    binance_client, pair: str, data_provider=None
+) -> dict:
     """Fetch OHLCV data and calculate RSI, MACD, and Bollinger Bands.
 
     Args:
-        binance_client: The BinanceClient instance
-        pair: Trading pair string, e.g. "ETHUSDT"
+        binance_client:  The BinanceClient instance (used as fallback if no cache)
+        pair:            Trading pair string, e.g. "ETHUSDT"
+        data_provider:   Optional DataProvider for cached kline fetches.
+                         When provided, avoids duplicate REST calls across pollers.
 
     Returns:
         dict with rsi, macd bundle, bb bundle
     """
     try:
-        klines = await binance_client.get_klines(pair, interval="3m", limit=120)
+        if data_provider is not None:
+            klines = await data_provider.get_klines(pair, interval="3m", limit=120)
+        else:
+            klines = await binance_client.get_klines(pair, interval="3m", limit=120)
         if not klines or len(klines) < 30:
             logger.warning(f"Insufficient kline data for {pair}: {len(klines)} candles")
             return _last_known.get(pair, _default_result())

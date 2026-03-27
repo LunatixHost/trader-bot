@@ -40,12 +40,13 @@ _PRICE_PROXIMITY_PCT = 0.005  # 0.5%
 _MIN_IMPULSE_RATIO = 0.50
 
 
-async def detect_fvg(binance_client, pair: str) -> dict:
+async def detect_fvg(binance_client, pair: str, data_provider=None) -> dict:
     """Detect a bullish Fair Value Gap on 5m candles.
 
     Args:
-        binance_client: BinanceClient instance (for kline fetches).
-        pair: e.g. "ETHUSDT"
+        binance_client: BinanceClient instance (used as fallback if no cache).
+        pair:           e.g. "ETHUSDT"
+        data_provider:  Optional DataProvider for cached kline fetches.
 
     Returns:
         dict with keys:
@@ -57,9 +58,13 @@ async def detect_fvg(binance_client, pair: str) -> dict:
     try:
         # Fetch a few extra candles beyond the scan window so the triplet at
         # position 0 has valid prior context.
-        klines = await binance_client.get_klines(
-            pair, interval="5m", limit=_SCAN_WINDOW + 5
-        )
+        _limit = _SCAN_WINDOW + 5
+        if data_provider is not None:
+            klines = await data_provider.get_klines(pair, interval="5m", limit=_limit)
+        else:
+            klines = await binance_client.get_klines(
+                pair, interval="5m", limit=_limit
+            )
         if not klines or len(klines) < 3:
             return _DEFAULT.copy()
 

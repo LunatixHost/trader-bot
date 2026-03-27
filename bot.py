@@ -71,6 +71,7 @@ from signal_weights import compute_signal_weights
 from signals.rsi import fetch_technical_indicators
 from signals.etherscan import fetch_etherscan
 from signals.orderbook import fetch_orderbook_signals
+from market_data import init_market_data, data_provider, market_dynamics_loop
 
 # ─── ANSI Color Codes ────────────────────────────────────────────────
 
@@ -134,7 +135,7 @@ async def poll_rsi(pair: str):
     """Poll RSI + MACD + Bollinger Bands + ATR + regime for a pair."""
     while True:
         try:
-            result = await fetch_technical_indicators(binance, pair)
+            result = await fetch_technical_indicators(binance, pair, data_provider)
             async with state.lock:
                 ps = state.pairs[pair]
                 ps.rsi = result["rsi"]
@@ -285,7 +286,7 @@ async def poll_fvg(pair: str, initial_delay: float = 0):
         await asyncio.sleep(initial_delay)
     while True:
         try:
-            result = await detect_fvg(binance, pair)
+            result = await detect_fvg(binance, pair, data_provider)
             async with state.lock:
                 ps = state.pairs[pair]
                 # Only update FVG state if no limit order is pending
@@ -1810,6 +1811,9 @@ async def start():
     # Connect to Binance
     await binance.connect()
 
+    # Initialise Market Dynamics Engine (DataProvider cache + VolumePairList)
+    init_market_data(binance)
+
     # Fetch USDT balance + all coin balances to compute true total portfolio value
     usdt = await binance.get_balance("USDT")
     total_value = usdt  # Start with USDT, add coin values below
@@ -1940,6 +1944,9 @@ async def start():
     tasks.append(asyncio.create_task(signal_weight_learning_loop()))
     tasks.append(asyncio.create_task(drawdown_tracking_loop()))
     tasks.append(asyncio.create_task(btc_crash_detection_loop()))
+
+    # Market Dynamics Engine — kline cache warm-up + volume pairlist refresh
+    tasks.append(asyncio.create_task(market_dynamics_loop()))
 
     # Event-driven execution worker (replaces timer-based trading_loop)
     tasks.append(asyncio.create_task(real_time_execution_worker()))
