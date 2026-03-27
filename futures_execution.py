@@ -49,10 +49,19 @@ exchange = ccxt.binance({
 })
 
 if USE_TESTNET:
-    # set_sandbox_mode patches ALL fapi URL keys in one call (ccxt 4.x official method).
-    # Manual per-key overrides only covered fapiPublic/fapiPrivate but missed
-    # fapiPrivateV2, fapiPrivateV3, etc. — causing -2008 on fetch_balance.
-    exchange.set_sandbox_mode(True)
+    # ccxt 4.5+ removed set_sandbox_mode for Binance futures.
+    # Override all 6 fapi URL keys manually so every request — including
+    # fetch_balance (fapiPrivateV2) and newer endpoints (fapiPrivateV3) —
+    # routes to testnet.binancefuture.com instead of fapi.binance.com.
+    _FAPI_TESTNET_V1 = "https://testnet.binancefuture.com/fapi/v1"
+    _FAPI_TESTNET_V2 = "https://testnet.binancefuture.com/fapi/v2"
+    _FAPI_TESTNET_V3 = "https://testnet.binancefuture.com/fapi/v3"
+    exchange.urls["api"]["fapiPublic"]   = _FAPI_TESTNET_V1
+    exchange.urls["api"]["fapiPrivate"]  = _FAPI_TESTNET_V1
+    exchange.urls["api"]["fapiPublicV2"] = _FAPI_TESTNET_V2
+    exchange.urls["api"]["fapiPrivateV2"]= _FAPI_TESTNET_V2
+    exchange.urls["api"]["fapiPublicV3"] = _FAPI_TESTNET_V3
+    exchange.urls["api"]["fapiPrivateV3"]= _FAPI_TESTNET_V3
     logger.info("Futures execution: TESTNET mode active (testnet.binancefuture.com)")
 
 
