@@ -174,7 +174,10 @@ def load_csv(path: str, no_header: bool = False) -> pd.DataFrame:
 
     if is_binance_vision:
         df = pd.read_csv(path, header=None, names=_BINANCE_VISION_COLS)
-        df["timestamp"] = pd.to_datetime(df["open_time_ms"], unit="ms", utc=True)
+        # Binance Vision timestamps: 13-digit = ms, 16-digit = µs — auto-detect
+        sample_ts = int(df["open_time_ms"].iloc[0])
+        ts_unit = "us" if sample_ts > 1e15 else "ms"
+        df["timestamp"] = pd.to_datetime(df["open_time_ms"], unit=ts_unit, utc=True)
     else:
         df = pd.read_csv(path)
         # Accept 'open_time' alias (Binance Vision with header)
@@ -195,7 +198,7 @@ def load_csv(path: str, no_header: bool = False) -> pd.DataFrame:
 
     logger.info(
         f"Loaded {len(df):,} candles  "
-        f"[{df['timestamp'].iloc[0]}  →  {df['timestamp'].iloc[-1]}]"
+        f"[{df['timestamp'].iloc[0]}  to  {df['timestamp'].iloc[-1]}]"
     )
     return df
 
@@ -509,7 +512,16 @@ class BacktestEngine:
         fee_pct: float = ROUND_TRIP_COST_PCT / 2,
         slippage_pct: float = 0.0,
         verbose: bool = True,
+        threshold_scale: float = 0.65,
     ):
+        # threshold_scale: multiplied onto CONFIDENCE_BUY_THRESHOLD after
+        # _update_dynamic_params_sim(). Compensates for structure_score and
+        # volatility_score being unimplemented in the live bot (always 0.0).
+        # Those fields were intended to contribute ~1 pt to effective score;
+        # without them the max achievable effective = ~1.8 vs threshold 2.7.
+        # 0.65 → threshold = 2.7 × 0.65 = ~1.75, just below max signal output.
+        # Override with --threshold-scale on the CLI to test other levels.
+        self.threshold_scale = threshold_scale
         self.df              = df
         self.pair            = pair
         self.base_asset      = get_base_asset(pair)
@@ -827,6 +839,9 @@ class BacktestEngine:
 
             # Update dynamic params (volatility_factor, TP1 scaling, regime mode)
             _update_dynamic_params_sim(ps)
+            # Apply threshold scale to compensate for unimplemented structure_score
+            ps.dynamic_params["buy_threshold"] *= self.threshold_scale
+            ps.dynamic_params["effective_threshold"] = ps.dynamic_params["buy_threshold"]
 
             # Update trailing stop ratchet using sim time
             self._update_trailing_stop(sim_now)
@@ -1004,7 +1019,7 @@ class BacktestReport:
             return
         print(f"\n  {'#':>4}  {'Timestamp':<24}  {'Side':<8}  {'Price':>12}  "
               f"{'Qty':>12}  {'PnL $':>9}  {'PnL %':>7}  {'Reason':<22}  Hold")
-        print("  " + "─" * 120)
+        print("  " + "-" * 120)
         for n, t in enumerate(sells, 1):
             sign = "+" if t.pnl_usdt >= 0 else ""
             print(
@@ -1027,11 +1042,11 @@ class BacktestReport:
         exit_br    = self.exit_reason_breakdown()
 
         lbl = f"  [{label}]" if label else ""
-        bar = "═" * 65
+        bar = "=" * 65
         print(f"\n  {bar}")
-        print(f"  BACKTEST RESULTS{lbl}  —  {self.pair}")
+        print(f"  BACKTEST RESULTS{lbl}  --  {self.pair}")
         print(f"  {bar}")
-        print(f"  Capital:         ${self.starting_capital:>10,.2f}  →  ${self.final_balance:>10,.2f}")
+        print(f"  Capital:         ${self.starting_capital:>10,.2f}  ->  ${self.final_balance:>10,.2f}")
         print(f"  Net P&L:         {'+' if net_pnl >= 0 else ''}${net_pnl:>10.2f}  ({'+' if ret_pct >= 0 else ''}{ret_pct:.2f}%)")
         print(f"  Total fees:      ${fees:>10.2f}")
         print(f"  Trades:          {n_trades:>10,}")
@@ -1045,6 +1060,16 @@ class BacktestReport:
             print(f"    {reason:<22} {count:>5}x")
         print(f"  {bar}\n")
 
+    def print_sweep_row(self, label: str):
+        """One-line summary row for sweep table output."""
+        ret = (self.final_balance - self.starting_capital) / self.starting_capital * 100
+        print(
+            f"  {label:<28}  ${self.total_net_pnl():>9.2f}  "
+            f"{ret:>7.2f}%  {self.win_rate():>7.1f}%  "
+            f"{self.profit_factor():>6.2f}  {self.max_drawdown_pct():>7.2f}%  "
+            f"{self.sharpe_ratio():>8.3f}  {self.total_trades():>7,}"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Parameter sweep
@@ -1057,6 +1082,7 @@ async def run_sweep(
     rsi_thresholds: List[float],
     conf_thresholds: List[float],
     slippage_pct: float = 0.0,
+    threshold_scale: float = 0.65,
 ):
     """Grid search over RSI and confidence thresholds.
 
@@ -1082,7 +1108,7 @@ async def run_sweep(
             label = f"RSI<{rsi_t:.0f} / CONF≥{conf_t:.1f}"
             logger.info(f"Sweep run {run_n}/{total}: {label}")
 
-            engine = BacktestEngine(df, pair, capital, slippage_pct=slippage_pct, verbose=False)
+            engine = BacktestEngine(df, pair, capital, slippage_pct=slippage_pct, verbose=False, threshold_scale=threshold_scale)
             report = await engine.run()
             results.append((label, report))
 
@@ -1091,12 +1117,12 @@ async def run_sweep(
     cfg.CONFIDENCE_BUY_THRESHOLD = 2.7
 
     # Summary table
-    print(f"\n  {'─' * 80}")
-    print(f"  PARAMETER SWEEP  —  {pair}  ({total} combinations)")
-    print(f"  {'─' * 80}")
+    print(f"\n  {'-' * 80}")
+    print(f"  PARAMETER SWEEP  --  {pair}  ({total} combinations)")
+    print(f"  {'-' * 80}")
     print(f"  {'Label':<28}  {'Net PnL':>10}  {'Return':>8}  {'WinRate':>8}  "
           f"{'PF':>6}  {'MaxDD':>8}  {'Sharpe':>8}  {'Trades':>7}")
-    print(f"  {'─' * 80}")
+    print(f"  {'-' * 80}")
     for label, r in sorted(results, key=lambda x: -x[1].total_net_pnl()):
         ret = (r.final_balance - r.starting_capital) / r.starting_capital * 100
         print(
@@ -1105,7 +1131,7 @@ async def run_sweep(
             f"{r.profit_factor():>6.2f}  {r.max_drawdown_pct():>7.2f}%  "
             f"{r.sharpe_ratio():>8.3f}  {r.total_trades():>7,}"
         )
-    print(f"  {'─' * 80}\n")
+    print(f"  {'-' * 80}\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1139,6 +1165,12 @@ async def main():
         help="One-way slippage %%. Default: 0 (conservative estimate: try 0.03)"
     )
     parser.add_argument(
+        "--threshold-scale", type=float, default=0.65, dest="threshold_scale",
+        help="Scale factor applied to CONFIDENCE_BUY_THRESHOLD (default 0.65). "
+             "Compensates for structure_score/volatility_score being unimplemented "
+             "in the live bot (always 0). 0.65 -> threshold ~1.75 vs max score ~1.8."
+    )
+    parser.add_argument(
         "--summary-only", action="store_true",
         help="Suppress trade-by-trade log; show only the summary table."
     )
@@ -1163,6 +1195,10 @@ async def main():
             f"(no max_score cap from config, uses defaults)"
         )
 
+    # Suppress noisy sub-loggers that fire on every candle during simulation
+    for _noisy in ("trading_bot.regime", "trading_bot.signals.rsi"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     df = load_csv(args.csv, no_header=args.no_header)
 
     if args.sweep:
@@ -1172,6 +1208,7 @@ async def main():
             df, pair, args.capital,
             rsi_thresholds, conf_thresholds,
             slippage_pct=args.slippage,
+            threshold_scale=args.threshold_scale,
         )
     else:
         verbose = not args.summary_only
@@ -1181,6 +1218,7 @@ async def main():
             fee_pct          = args.fee,
             slippage_pct     = args.slippage,
             verbose          = verbose,
+            threshold_scale  = args.threshold_scale,
         )
         report = await engine.run()
 
