@@ -93,6 +93,10 @@ async def enforce_futures_environment():
         err_str = str(e)
         if "-4059" in err_str or "No need to change" in err_str:
             logger.info("Futures: One-Way Mode already active")
+        elif "-2015" in err_str:
+            # Demo trading API does not expose the positionSide/dual endpoint.
+            # Position mode is fixed to One-Way on demo — safe to continue.
+            logger.info("Futures: positionSide/dual not supported on demo API — One-Way Mode assumed")
         else:
             logger.error(f"Futures: enforce_futures_environment failed: {e}")
             raise
