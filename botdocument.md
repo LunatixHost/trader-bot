@@ -1,7 +1,7 @@
 # Trading Bot — Complete Documentation
 
-> Last updated: 2026-03-26 (rev 3)
-> Mode: **Scalping** | Exchange: **Binance Spot** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
+> Last updated: 2026-03-28 (rev 4)
+> Mode: **Scalping + Long-Term + Futures Paper** | Exchange: **Binance Spot** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
 
 ---
 
@@ -14,99 +14,160 @@
 5. [Effective Score](#5-effective-score)
 6. [Entry Filters (BUY Gates)](#6-entry-filters-buy-gates)
 7. [Exit System (SELL Logic)](#7-exit-system-sell-logic)
-8. [Adaptive Signal Weights](#8-adaptive-signal-weights)
-9. [Portfolio Management](#9-portfolio-management)
-10. [BTC Crash Filter](#10-btc-crash-filter)
-11. [Correlation System](#11-correlation-system)
-12. [Discord Control Panel](#12-discord-control-panel)
-13. [Web Dashboard](#13-web-dashboard)
-14. [Database & Logging](#14-database--logging)
-15. [Configuration Reference](#15-configuration-reference)
+8. [Position Sizing](#8-position-sizing)
+9. [Adaptive Signal Weights](#9-adaptive-signal-weights)
+10. [Portfolio Management](#10-portfolio-management)
+11. [BTC Crash Filter](#11-btc-crash-filter)
+12. [Correlation System](#12-correlation-system)
+13. [Market Dynamics Engine](#13-market-dynamics-engine)
+14. [Long-Term Portfolio Layer](#14-long-term-portfolio-layer)
+15. [Futures Paper Trading Layer](#15-futures-paper-trading-layer)
+16. [Discord Control Panel](#16-discord-control-panel)
+17. [Web Dashboard](#17-web-dashboard)
+18. [Database & Logging](#18-database--logging)
+19. [Configuration Reference](#19-configuration-reference)
 
 ---
 
 ## 1. Architecture Overview
 
-The bot runs as a **single Python asyncio process**. All components — signal polling, trading loop, Discord bot, web API — run concurrently as async tasks without threads blocking each other.
+The bot runs as a **single Python asyncio process**. All components — signal polling, trading loop, Discord bot, web API, futures paper layer — run concurrently as async tasks without threads blocking each other.
 
 ### Startup Sequence
 
 ```
-1. Load .env  →  validate Binance + Discord API keys
-2. Connect to Binance (testnet or live)
-3. Load saved state from trades.db (or create fresh)
-4. Open WebSocket price stream per pair
-5. Start signal polling tasks per pair (staggered to avoid rate limits)
-6. Launch Discord bot
-7. Start FastAPI web server (dashboard)
-8. Begin trading loop
+1.  Load .env  →  validate Binance + Discord API keys
+2.  Connect to Binance (testnet or live)
+3.  Load saved state from trades.db (or create fresh)
+4.  Fetch initial prices for all pairs
+5.  Open WebSocket symbol-ticker stream per pair   (price ticks → execution queue)
+6.  Open WebSocket kline-close stream per pair     (candle close → indicator recalc)
+7.  Init Market Dynamics Engine (DataProvider cache + VolumePairList)
+8.  Start signal polling tasks per pair (staggered 5s apart to spread rate limits)
+9.  Start portfolio management tasks
+10. Start event-driven execution worker
+11. Start kline-close indicator worker (Phase 5)
+12. Start long-term portfolio loop (if enabled)
+13. Start futures paper trading loop (if enabled)
+14. Start Market Dynamics refresh loop
+15. Launch Discord bot
+16. Start FastAPI web dashboard server
 ```
 
-### Main Loop (per pair, every price tick)
+### Event-Driven Execution Model
+
+The bot does **not** poll on a timer. Trade evaluation is driven by WebSocket events:
 
 ```
-WebSocket tick → update current_price
-       ↓
-get_decision(pair_state, bot_state)
-       ↓
-   ┌───────────────────────────────────────┐
-   │  If HOLDING:  Run SELL checks         │
-   │  If NOT:      Run BUY gates           │
-   └───────────────────────────────────────┘
-       ↓
-  BUY → execute_buy()   SELL → execute_sell()   HOLD → nothing
+symbol_ticker WebSocket tick
+        │
+        ▼
+BinanceClient._price_stream_loop()
+  → ps.current_price = new_price
+  → if pair not already in queue:
+        price_event_queue.put(pair)
+        │
+        ▼
+real_time_execution_worker()  (runs continuously, drains queue)
+  → evaluate_and_trade(pair)
+  → update_portfolio_tracking()
 ```
+
+**Indicator recalc at candle close (Phase 5):**
+```
+kline WebSocket stream  →  kline['x'] == True (candle officially closed)
+        │
+        ▼
+kline_close_queue.put(pair)
+        │
+        ▼
+poll_rsi_on_close()  (dedicated worker, drains queue)
+  → fetch_technical_indicators()   ← full recalc at T+0 milliseconds
+  → update all ps indicator fields
+```
+
+The 10-second REST polling loop (`poll_rsi`) remains active as a fallback. Both paths write identical state fields; neither conflicts.
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `bot.py` | Main entry point, trading loop, signal pollers, order execution |
+| `bot.py` | Main entry point, event loop, signal pollers, order execution |
 | `strategy.py` | Decision engine: confidence scoring, all BUY/SELL logic |
-| `config.py` | All tuneable parameters |
-| `state.py` | `BotState` + `PairState` dataclasses, DB persistence |
+| `config.py` | All tuneable parameters — single source of truth |
+| `state.py` | `BotState`, `PairState`, `FuturesPaperState`, `LongTermState` dataclasses + DB persistence |
 | `regime.py` | Regime classification (ATR + EMA spread) |
 | `portfolio.py` | Portfolio value tracking, reserve management |
 | `signal_weights.py` | Adaptive weight learning from trade history |
-| `signals/rsi.py` | RSI, MACD, Bollinger Bands, ATR, wick ratio, liquidity sweep |
-| `signals/coingecko.py` | Volume spike detection, 24h price change |
-| `signals/whale_alert.py` | On-chain large transaction detection |
-| `signals/etherscan.py` | Ethereum gas + network activity (ETH only) |
-| `signals/google_trends.py` | Google Trends search interest per coin |
-| `signals/fear_greed.py` | Crypto Fear & Greed Index |
+| `market_data.py` | DataProvider (kline cache) + VolumePairList (dynamic pairlist) |
+| `futures_paper.py` | Simulated futures SHORT/LONG paper positions |
+| `backtest_engine.py` | Offline historical backtesting engine |
+| `binance_client.py` | Async python-binance wrapper: REST + WebSocket |
+| `signals/rsi.py` | RSI, MACD, BB, ATR, regime, wick ratio, liquidity sweep, structure_score, volatility_score |
 | `signals/fvg.py` | Fair Value Gap detection on 5m candles |
 | `signals/orderbook.py` | Orderbook imbalance + trade flow (microstructure) |
+| `signals/etherscan.py` | Ethereum gas + network activity (ETH only) |
 | `discord_bot/` | Discord panel, buttons, views |
-| `dashboard/` | Web terminal (FastAPI + TradingView Lightweight Charts) |
-| `trades.db` | SQLite database — all trades, snapshots, signal history |
+| `api.py` | FastAPI web dashboard server |
+| `trades.db` | SQLite database (WAL mode) — all trades, snapshots, state |
 
 ---
 
 ## 2. Signal Sources
 
-The bot uses **8 active signal sources** across 4 polling tiers. All signals feed into the confidence scoring engine. A 9th source (CryptoCompare social stats) is implemented in `signals/cryptocompare.py` but currently disabled — its output is not consumed by the strategy.
+The bot uses **8 active signal sources** across 4 polling tiers. All signals feed into the confidence scoring engine.
 
 ### Tier 1 — Every 10 seconds (`INTERVAL_RSI = 10`, `INTERVAL_ORDERBOOK = 10`)
 
-Computed from the same Binance OHLCV fetch (15m candles) plus a live orderbook fetch. No heavy API calls.
+Computed from Binance OHLCV (15m candles) + live orderbook. Kline-close WebSocket also triggers immediate recalc at candle boundary.
 
 | Signal | What it measures | Buy condition |
 |--------|-----------------|---------------|
-| **RSI** | Relative Strength Index (14-period, Wilder's smoothing) | RSI < 55 (oversold) |
+| **RSI** | Relative Strength Index (14-period, Wilder's smoothing) | RSI < 48 (oversold) |
 | **MACD** | MACD histogram crossover (12/26/9 EMA) | Bullish crossover (histogram turning positive) |
 | **Bollinger Bands** | Price position relative to 20-period BB (2σ) | Price below lower band |
-| **ATR** | Average True Range — used for exits, not scoring | — |
-| **Liquidity Sweep** | Wick below recent swing low scaled by ATR depth | Sweep score contributes to effective score |
+| **ATR** | Average True Range — used for exits and sizing, not confidence scoring | — |
+| **structure_score** | Directional price-action composite from candle data | Positive values boost effective score |
+| **volatility_score** | BB bandwidth expansion vs 5 candles prior | Positive values boost effective score |
+| **Liquidity Sweep** | Wick below recent swing low, scaled by ATR depth | Sweep score contributes to effective score |
 | **Orderbook Imbalance** | bid_vol / (bid + ask), top 5 levels, EMA-smoothed (α=0.3) | Imbalance > 0.6 = buyers stacking |
 | **Trade Flow Ratio** | buyer-aggressor volume / total, last 50 trades, EMA-smoothed | Flow ratio > 0.6 = buyers lifting asks |
+
+#### structure_score Calculation
+
+Computed in `signals/rsi.py` from the last closed candle. Range approximately −0.8 to +1.3.
+
+```
+is_bullish = last_close > last_open
+
+vol_score:
+  if bullish:  min(0.6, max(0.0, (vol_ratio − 1.0) × 0.4))   ← 0 to +0.6
+  if bearish:  min(0.0, max(−0.3, (vol_ratio − 1.0) × −0.2)) ← −0.3 to 0
+
+body_score   = max(−0.5, min(0.5, body_ratio × 0.6))
+close_score  = (close_position_in_range − 0.5) × 0.4
+
+structure_score = vol_score + body_score + close_score
+```
+
+Directional by design: high-volume bearish candles produce negative values; high-volume bullish candles produce positive values. This prevents crash panic-selling from being mis-scored as a bullish signal.
+
+#### volatility_score Calculation
+
+```
+bw_now = (bb_upper − bb_lower) / bb_middle
+expansion = (bw_now − bw_5_candles_ago) / bw_5_candles_ago
+
+volatility_score = max(−0.3, min(0.5, expansion × 5.0))
+```
+
+Positive when BB bandwidth is expanding (directional move in progress). Negative when contracting.
 
 ### Tier 2 — Every 60 seconds (`INTERVAL_COINGECKO = 60`)
 
 | Signal | What it measures | Buy condition |
 |--------|-----------------|---------------|
 | **CoinGecko Volume** | 24h volume vs rolling average | Volume > 1.5× average = spike |
-
-Volume spike sets both `volume_spike` and `volume_confirmed` — used by the chop gate and momentum decay exit.
 
 ### Tier 3 — Every 2–15 minutes
 
@@ -120,44 +181,49 @@ Volume spike sets both `volume_spike` and `volume_confirmed` — used by the cho
 
 | Signal | What it measures | Buy condition |
 |--------|-----------------|---------------|
-| **Fear & Greed Index** | Market-wide sentiment (0=Extreme Fear, 100=Extreme Greed) | Score ≤ 50 (fear zone) |
+| **Fear & Greed Index** | Market-wide sentiment (0=Extreme Fear, 100=Extreme Greed) | Score ≤ 65 |
 
 Fear & Greed is **shared across all pairs** — one fetch covers all six coins.
 
 ### FVG — Every 60 seconds (`INTERVAL_FVG = 60`)
 
-**Fair Value Gap** detection on 5m candles. A FVG is an imbalance gap where a middle candle's body doesn't overlap the wicks of the candles before and after it.
+**Fair Value Gap** detection on 5m candles. Scans up to 6 recent candle triplets. A bullish FVG exists when:
+```
+Candle[i-2].high  < Candle[i].low        (gap between them)
+Candle[i-1] = strong impulse candle       (body/range ≥ 50%)
+gap_size ≥ FVG_MIN_GAP_PCT (0.1%) of price
+current_price ≤ gap_top × 1.005          (reachable — not already blown past)
+```
 
-FVG is an **active execution edge**, not a passive score boost. Detected gaps are validated before triggering any order:
+Entry price = midpoint = `(gap_top + gap_bottom) / 2`
 
-**Validation gates (all must pass):**
-- Gap size ≥ 0.1% of current price (`FVG_MIN_GAP_PCT`) — smaller gaps are noise
-- Gap age ≤ 300s (`FVG_MAX_AGE_SECONDS`) — stale gaps (> 1 candle old) are discarded
-- `fast_score ≥ 2.0` — minimum technical conviction required
-- `orderbook_imbalance ≥ 0.5` — microstructure must not be bearish
-- FVG cooldown: 5 minutes between FVG-driven trades on the same pair
+FVG adds **+0.5** to the effective score when active.
+
+**Validation gates (all must pass before an FVG order is placed):**
+- Gap size ≥ 0.1% of current price
+- Gap age ≤ 300s
+- `fast_score ≥ 2.0`
+- `orderbook_imbalance ≥ 0.5`
+- FVG cooldown: 5 minutes between FVG-driven trades on same pair
 
 **Two entry paths:**
 
 | Path | Condition | Order type |
 |------|-----------|------------|
-| Standard | `current_price > fvg_mid` (price above gap midpoint — approaching from above) | Limit buy at `fvg_mid` |
-| Early entry | `fvg_bottom < current_price ≤ fvg_mid` (price already inside the gap) | Market buy immediately |
+| Standard | `current_price > fvg_mid` | Limit buy at `fvg_mid` |
+| Early entry | `fvg_bottom < current_price ≤ fvg_mid` | Market buy immediately |
 
-- Standard path: limit order placed, `fvg_limit_active = True` while waiting for fill. Order cancelled if unfilled after **60s** (`FVG_ORDER_TIMEOUT`).
-- Early path: market buy executed; `fvg_entry = True` flag set on position.
+Limit orders cancelled if unfilled after 60s (`FVG_ORDER_TIMEOUT`).
 
-**FVG-specific exits (highest priority after hard stop-loss):**
-- **FVG failure exit**: if price drops below `fvg_bottom` while in a FVG entry → immediate SELL
-- **FVG profit accelerator**: if gain ≥ 0.25% on a FVG entry → immediate SELL (tighter than micro TP)
-
-FVG adds **+0.5** to the effective score when active (only if `fvg_detected = True`).
+**FVG-specific exits:**
+- **FVG failure**: price drops below `fvg_bottom` → immediate SELL
+- **FVG profit accelerator**: gain ≥ 0.25% on FVG entry → immediate SELL
 
 ### Signal Applicability Per Pair
 
 | Signal | ETH | BTC | BNB | XRP | BCH | SUI |
 |--------|-----|-----|-----|-----|-----|-----|
-| RSI / MACD / BB | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| RSI / MACD / BB / structure / volatility | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Orderbook / Flow | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | CoinGecko Volume | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Fear & Greed | ✓ shared | ✓ shared | ✓ shared | ✓ shared | ✓ shared | ✓ shared |
@@ -175,45 +241,38 @@ Every RSI cycle, the bot classifies each pair into one of **4 regimes** using AT
 
 ```
 ATR% = ATR / current_price
-Trend strength = |EMA20 - EMA50| / price
+Trend strength = |EMA20 − EMA50| / price
 
 is_volatile  = ATR% > 1.5%
 is_trending  = trend_strength > 0.5%
 
-         | Not Trending  | Trending           |
----------|---------------|---------------------|
-Normal   | ranging       | trending            |
-Volatile | choppy_volatile | trending_volatile |
+         | Not Trending    | Trending             |
+---------|-----------------|----------------------|
+Normal   | ranging         | trending             |
+Volatile | choppy_volatile | trending_volatile    |
 ```
 
 ### Hysteresis
 
-Regime **must be seen 3 consecutive times** before switching. In extreme volatility (ATR% > 3%), only 2 confirmations needed. This prevents the regime from flickering at boundaries on every candle.
+Regime **must be seen 3 consecutive times** before switching. In extreme volatility (ATR% > 3%), only 2 confirmations needed.
 
 ### Trend Direction
 
-Separately from regime, `trend_direction` tracks EMA20 vs EMA50:
-- `"up"` → EMA20 > EMA50 (bullish medium-term)
-- `"down"` → EMA20 < EMA50 (bearish medium-term)
-- `"flat"` → insufficient data
-
-`trend_direction` feeds into:
-- `pair_state.trend` label (`"uptrend"` / `"downtrend"` / `"chop"`)
-- Downtrend guard in BUY logic
-
-### Regime → `pair_state.trend` Label
+`trend_direction` tracks EMA20 vs EMA50 (EMA periods: `REGIME_EMA_FAST = 20`, `REGIME_EMA_SLOW = 50`):
 
 | trend_direction | pair_state.trend |
 |-----------------|-----------------|
-| `"up"` | `"uptrend"` |
-| `"down"` | `"downtrend"` |
+| `"up"` (EMA20 > EMA50) | `"uptrend"` |
+| `"down"` (EMA20 < EMA50) | `"downtrend"` |
 | `"flat"` | `"chop"` |
+
+`trend` feeds into scoring penalties, downtrend position sizing, and futures entry gates.
 
 ---
 
 ## 4. Confidence Scoring
 
-Replaces the old flat signal count with a **weighted, category-capped, regime-adjusted** score.
+A **weighted, category-capped, regime-adjusted** score. Replaces the old flat signal count.
 
 ### Formula
 
@@ -223,8 +282,6 @@ confidence = Σ ( signal_value × learned_weight × regime_modifier )
 ```
 
 ### Signal Categories & Caps
-
-Each category has a maximum contribution to prevent correlated signals from double-counting.
 
 | Category | Signals | Cap |
 |----------|---------|-----|
@@ -236,8 +293,6 @@ Each category has a maximum contribution to prevent correlated signals from doub
 
 ### Regime Modifiers
 
-Each regime boosts/reduces category weights:
-
 | Category | trending | ranging | choppy_volatile | trending_volatile |
 |----------|----------|---------|-----------------|-------------------|
 | mean_reversion | 0.6× | 1.4× | 0.7× | 0.5× |
@@ -246,17 +301,15 @@ Each regime boosts/reduces category weights:
 | onchain | 1.0× | 1.0× | 1.2× | 1.0× |
 | macro | 1.0× | 1.0× | 1.0× | 0.8× |
 
-> **Example**: In `ranging` regime, RSI and BB are boosted (1.4×) because mean-reversion works best in sideways markets. MACD is reduced (0.6×) because it gives false signals in chop.
-
 ### MACD Dampening
 
-MACD's learned weight is additionally halved (`× 0.5`) because it's a smoothing filter rather than a primary trigger — it confirms momentum but shouldn't dominate.
+MACD's learned weight is additionally halved (`× 0.5`) — it confirms momentum but shouldn't dominate.
 
 ---
 
 ## 5. Effective Score
 
-The final score used for buy decisions is the **buy_score**, built from raw confidence with soft adjustments applied. It is stored as `pair_state.effective_score` at the end of every strategy cycle.
+The final score used for buy decisions. Stored as `pair_state.effective_score`.
 
 ```
 raw_effective = confidence + structure_score + volatility_score
@@ -264,179 +317,161 @@ raw_effective = confidence + structure_score + volatility_score
 buy_score = raw_effective
           − 1.0   if wick_ratio > 60%          (exhaustion / distribution)
           − 0.8   if 0 < ATR% < 0.3%           (minimum edge not met)
-          − 1.0   if RR < 1.0                  (reward doesn't justify risk)
-          − 0.5   if 1.0 ≤ RR < 1.20          (marginal R/R)
+          − 1.0   if RR < 1.0                  (reward below risk)
+          − 0.5   if 1.0 ≤ RR < 1.20           (marginal R/R)
           − 1.0   if trend == "downtrend"       (counter-trend penalty)
           + 0.3   if trend == "uptrend"         (dip-buying-with-trend boost)
           − 0.3   if regime == "choppy_volatile" (noisy signal environment)
 ```
 
-`structure_score` and `volatility_score` are computed by `regime.py` and stored on `PairState`. Both are currently `0.0` in all regimes (reserved for future expansion).
-
-**Key principle:** conditions that previously hard-blocked trades are now score penalties. A high-conviction setup can absorb penalties and still exceed the threshold; a weak setup will not.
+`structure_score` is computed from directional candle data (vol ratio, body ratio, close position). `volatility_score` is computed from BB bandwidth expansion. Both are live values from `signals/rsi.py`.
 
 ### R/R Calculation
 
 ```
 expected_reward = max(tp1_pct, ATR% × ATR_TP_MULTIPLIER × 100, 0.35%)
-expected_risk   = max(STOP_LOSS_PCT, ATR% × ATR_TRAILING_MULTIPLIER × 100, 0.20%)
+expected_risk   = max(STOP_LOSS_PCT, ATR% × ATR_SL_MULTIPLIER × 100, 0.20%)
 RR = expected_reward / expected_risk
 ```
 
+`STOP_LOSS_PCT` (0.5%) is the floor; `ATR_SL_MULTIPLIER` (1.5×) widens the risk estimate to match the dynamic stop in volatile conditions.
+
 ### Dynamic Buy Threshold
 
-The threshold the buy_score must exceed is not fixed:
-
 ```
-threshold = pair_state.dynamic_params["buy_threshold"]   ← per-pair base (volatility-scaled)
-          + DRAWDOWN_THRESHOLD_BOOST  if in_drawdown      (+ 0.5)
-          + BTC_CRASH_THRESHOLD_BOOST if btc_crash_active (+ 1.0)
+threshold = dynamic_params["buy_threshold"]   (per-pair, volatility-scaled)
+          + DRAWDOWN_THRESHOLD_BOOST (+0.5)   if in_drawdown
+          + BTC_CRASH_THRESHOLD_BOOST (+1.0)  if btc_crash_active
 ```
 
-The per-pair base threshold uses a **volatility factor** (current ATR / 20-period avg ATR) with exponential smoothing, clamped to [0.5×, 1.5×]. High volatility → higher threshold.
+Per-pair base uses a **volatility factor** (current ATR / 20-period avg ATR), exponentially smoothed, clamped to [0.5×, 1.5×].
 
-Base threshold: **3** (configurable via `CONFIDENCE_BUY_THRESHOLD`).
+Base threshold: **2.0** (`CONFIDENCE_BUY_THRESHOLD`).
 
 ---
 
-## 6. Entry Decision System (Weighted Scoring)
-
-The bot uses a **weighted scoring system, not sequential gating**. Adverse conditions reduce the `buy_score` (soft penalties) rather than hard-blocking the trade. Only a small number of execution-safety checks remain as hard stops.
+## 6. Entry Decision System
 
 ### Strategy Layer (`strategy.py`)
-
-`get_decision()` produces BUY / SELL / HOLD. It applies all signal interpretation, scoring, and penalty logic.
 
 #### Dead Market (hard block)
 ```
 if ATR% < 0.3% AND trend_strength < 0.1%:
-    → HOLD  (both conditions simultaneously — market too dead for any edge)
+    → HOLD
 ```
 
 #### Sell Conditions (when holding)
-Three signal-based exits trigger a SELL from strategy, tagged with `sell_reason = "signal"`:
 ```
-RSI > RSI_SELL_THRESHOLD (70)   → SELL
-MACD crossover == "bearish"     → SELL
-orderbook_imbalance < 0.4       → SELL
+RSI > 70                        → SELL (signal)
+MACD crossover == "bearish"     → SELL (signal)
+orderbook_imbalance < 0.4       → SELL (signal)
 ```
 
-#### Early Failure Exit (when holding)
+#### Early Failure Exit
 ```
-if holding AND raw_effective < threshold - 1.5:
-    sell_reason = "early_failure"
-    → SELL  (trade has lost signal conviction — exit before forced stops trigger)
+if holding AND raw_effective < threshold − 1.5:
+    → SELL tagged EARLY_FAILURE  (bypass sell guard)
 ```
-Uses `raw_effective` (pre-penalty score) — compares underlying signal quality, not the penalized buy_score.
 
 #### Buy Score Soft Penalties
-After computing `buy_score = raw_effective`, conditions reduce it:
 
-| Condition | Penalty |
-|-----------|---------|
-| `wick_ratio > 0.6` | −1.0 (exhaustion spike) |
-| `0 < ATR% < 0.3%` | −0.8 (minimum edge not met) |
-| `RR < 1.0` | −1.0 (reward below risk) |
-| `1.0 ≤ RR < 1.20` | −0.5 (marginal R/R) |
-| `trend == "downtrend"` | −1.0 (counter-trend) |
-| `trend == "uptrend"` | +0.3 (dip buying with trend) |
-| `regime == "choppy_volatile"` | −0.3 (noisy environment) |
+| Condition | Effect |
+|-----------|--------|
+| `wick_ratio > 0.6` | −1.0 |
+| `0 < ATR% < 0.3%` | −0.8 |
+| `RR < 1.0` | −1.0 |
+| `1.0 ≤ RR < 1.20` | −0.5 |
+| `trend == "downtrend"` | −1.0 |
+| `trend == "uptrend"` | +0.3 |
+| `regime == "choppy_volatile"` | −0.3 |
 
-#### Concurrent Position Cap (hard block)
+#### Concurrent Cap (hard block)
 ```
-if NOT holding AND open_positions >= MAX_CONCURRENT_TRADES (3):
-    → HOLD  (capital safety — hard limit)
+if NOT holding AND open_positions >= 3:
+    → HOLD
 ```
 
 #### BUY Decision
 ```
-if buy_score >= threshold:
-    → BUY
-else:
-    → HOLD
+if buy_score >= threshold → BUY
+else → HOLD
 ```
 
-### Execution Layer (`bot.py`)
+### Execution Layer (`bot.py` — `get_entry_block_reason`)
 
-`execute_buy()` has a second set of checks via `get_entry_block_reason()`. These run after strategy approves BUY and enforce capital safety / market-quality gates. Any blocker returns early without placing an order.
-
-The same function (`_entry_block_reason` mirror) is used by the panel to display the real blocking reason.
-
-#### Execution Blockers (in priority order)
+Secondary gatekeeping after strategy approves BUY. Checks in priority order:
 
 | # | Blocker | Condition |
 |---|---------|-----------|
-| 1 | `add_blocked` | Holding and `current_price < buy_price` (no averaging down into loss) |
-| 2 | `cooldown` | Time since last trade < cooldown (300s base, 180s in trending regimes); bypass if `effective_score ≥ threshold + 5.0` AND regime is trending |
-| 3 | `spike_filter` | Single tick moved > 0.3% — avoid chasing spikes |
-| 4 | `spread_filter` | Bid/ask spread > 0.15% (live only — testnet spreads are unreliable) |
-| 5 | `insufficient_spendable` | `usdt_balance − usdt_reserved ≤ $1` |
-| 6 | `position_maxed` | Position value ≥ `portfolio × MAX_POSITION_PCT (10%)` |
-| 7 | `min_notional` | Computed trade size < `MIN_TRADE_NOTIONAL ($20)` |
-| 8 | `fvg_cooldown` | FVG trade within last 300s on same pair |
-
-If any blocker returns a string, the buy is rejected and the reason is logged (debug level). The panel's WATCHING block shows this reason alongside the score.
+| 1 | `add_blocked` | Holding + `current_price < buy_price` (no averaging into loss) |
+| 2 | `cooldown` | Last trade < 300s ago (180s in trending regime); bypass at `eff ≥ threshold + 5.0` |
+| 3 | `failed_exit_cooldown` | Recent forced-exit on this pair within cooldown window |
+| 4 | `spike_filter` | Single tick > 0.3% move |
+| 5 | `unstable_candle` | Last candle range > 2.5× ATR (abnormally large candle) |
+| 6 | `spread_filter` | Bid/ask spread > 0.15% (live only — testnet bypassed) |
+| 7 | `insufficient_spendable` | `usdt_balance − usdt_reserved ≤ $1` |
+| 8 | `position_maxed` | Position ≥ `portfolio × MAX_POSITION_PCT (10%)` |
+| 9 | `min_notional` | Computed trade size < `MIN_TRADE_NOTIONAL ($20)` |
+| 10 | `fvg_cooldown` | FVG trade within last 300s on same pair |
 
 ### Signal Sell Guard (`_should_allow_signal_sell`)
 
-Strategy-originated SELLs tagged `sell_reason = "signal"` pass through a guard in `execute_sell()`. This prevents premature exits from weak sell signals while winners are still running.
+Prevents premature exits from weak sell signals while winners run:
 
 ```
 Allow SELL if any of:
-  1. pnl_pct >= max(tp1_pct, 0.35%)       (at or past TP1 — capture the gain)
-  2. hold_minutes >= hard_exit_minutes AND in profit (stale trade, still green)
-  3. pnl_pct > 0.10% AND eff < threshold − 1.0  (small green + collapsed signal — let it go)
+  1. pnl_pct >= 0.40%                          (at or past TP1 level)
+  2. peak_gain >= 0.50% AND pnl_pct > 0         (pulled back from peak but still green)
+  3. hold_minutes >= hard_exit_minutes AND green (stale trade)
+  4. pnl_pct > 0.40% AND eff < threshold − 1.0  (green + collapsed signal)
 ```
-
-Protective exits (`sell_reason = "early_failure"` or `"risk_exit"`) bypass this guard entirely and always execute.
 
 ---
 
 ## 7. Exit System (SELL Logic)
 
-Exits are split across two layers: **forced exits** (time/price stops, checked in `bot.py`) and **signal exits** (from strategy, filtered by a sell guard). The layers run in this order per trade cycle:
-
 ```
+Every price tick while holding:
 1. _get_forced_exit_reason()    ← price/time stops — always execute
-2. TP1 check                    ← profit target — always execute
+2. TP1 check                    ← partial profit target — always execute
 3. strategy.get_decision() SELL ← signal-based — filtered by _should_allow_signal_sell
 ```
 
-### Sell Action Taxonomy
+### Forced Exit Checks
 
-Every SELL writes a `note` to the trades table. The canonical set:
+#### 1. Hard Stop-Loss (Dynamic — Triple Barrier Lower Barrier)
 
-| Action | Source | Description |
-|--------|--------|-------------|
-| `SIGNAL_SELL` | Strategy signal | RSI/MACD/OB sell passed the sell guard |
-| `EARLY_FAILURE` | Strategy scoring | Trade lost signal conviction (`effective < threshold − 1.5`) |
-| `HARD_STOP` | Forced exit | Hard stop price hit |
-| `TRAIL_STOP` | Forced exit | Trailing stop triggered |
-| `TIME_STOP` | Forced exit | Hold time limit reached with insufficient gain |
-| `MAX_HOLD_EXIT` | Forced exit | Absolute maximum hold time exceeded |
-| `TP1_FULL_EXIT` | Profit target | TP1 threshold hit |
-| `FORCE SELL` | Discord manual | Owner-initiated via Abandon button |
-| `STOP_LOSS` | Legacy | Used in older trades; equivalent to HARD_STOP |
-
-### Forced Exit Checks (`_get_forced_exit_reason`)
-
-Checked before strategy decisions, in priority order:
-
-#### 1. Hard Stop-Loss
 ```
-hard_stop_price = entry × (1 − STOP_LOSS_PCT / 100)  ← also incorporates ATR-based initial stop
+atr_sl_pct     = ps.atr_pct × ATR_SL_MULTIPLIER (1.5) × 100
+effective_sl   = min(ATR_SL_MAX_PCT (2.0%), max(STOP_LOSS_PCT (0.5%), atr_sl_pct))
+hard_stop_price = entry × (1 − effective_sl / 100)
+
 if current_price <= hard_stop_price:
     → HARD_STOP
 ```
 
+The stop-loss widens with ATR to prevent whipsaw in volatile markets, with a floor of 0.5% and a ceiling of 2.0%.
+
+| ATR | Effective SL |
+|-----|-------------|
+| < 0.33% | 0.50% (floor) |
+| 0.50% | 0.75% |
+| 0.80% | 1.20% |
+| ≥ 1.33% | 2.00% (cap) |
+
 #### 2. ATR Trailing Stop
+
 ```
 if trailing_stop > 0 AND current_price <= trailing_stop:
     → TRAIL_STOP
 ```
-- Activates after `TRAILING_ACTIVATION_PCT` (0.5%) gain
-- Trails at `TRAILING_DISTANCE_PCT` (0.15%) below current price, ratchets up only
-- ATR-based initial stop = `entry − ATR × ATR_TRAILING_MULTIPLIER (2.0×)`, capped at 2%
+
+**Pre-TP1:** Activates after `ATR_TRAIL_ACTIVATION_PCT` (0.25%) gain.
+Trail = `entry − ATR × ATR_TRAILING_MULTIPLIER (1.5×)`, capped at `ATR_MAX_TRAIL_PCT` (2%) below price.
+
+**Post-TP1:** Activates after `TRAILING_ACTIVATION_PCT` (0.6%) gain.
+Tight fixed-distance trail: `current_price × (1 − TRAILING_DISTANCE_PCT / 100)` (0.25% below).
+Ratchets up only — never loosens.
 
 #### 3. Time Stop
 ```
@@ -450,43 +485,85 @@ if hold_minutes >= hard_exit_minutes × 1.5:
     → MAX_HOLD_EXIT
 ```
 
-`hard_exit_minutes` is derived from `SCALP_HARD_HOLD_MINUTES` (20 min), adjusted by regime.
+`hard_exit_minutes` is derived from `HARD_EXIT_MINUTES_BASE` (20 min), adjusted per regime.
 
-### TP1 Exit
+### TP1 Partial Exit
 
-Checked after forced exits. If `pnl_pct >= tp1_pct` (dynamic, default `BASE_TP1_PCT = 0.3%`):
-- Calls `execute_sell(note="TP1_FULL_EXIT")` directly — does not go through signal guard.
+Checked after forced exits. If `pnl_pct >= tp1_pct` (`BASE_TP1_PCT = 0.6%`):
+- Sells **50%** of position (`TP1_SELL_RATIO = 0.5`)
+- Moves stop-loss to breakeven + `BREAKEVEN_BUFFER_PCT` (0.20%)
+- Activates the tight post-TP1 trailing stop
 
 ### Strategy Signal Exits
 
-Strategy returns SELL with `sell_reason` tag. The execution layer routes by tag:
+| sell_reason | Execution |
+|-------------|-----------|
+| `"signal"` (RSI/MACD/OB) | Gated by `_should_allow_signal_sell` |
+| `"early_failure"` | Bypasses guard — always executes as `EARLY_FAILURE` |
 
-- `sell_reason = "early_failure"` → **bypass** sell guard, execute as `EARLY_FAILURE`
-- `sell_reason = "risk_exit"` → **bypass** sell guard (reserved, future use)
-- `sell_reason = "signal"` (RSI/MACD/OB) → **gated** by `_should_allow_signal_sell`
+### Exit Action Taxonomy
 
-When the sell guard blocks a signal sell, the trade continues to be managed by the forced exits. This prevents premature exits from noisy signal reversals while winners are still running.
-
-### Dust Handling
-
-When `execute_sell` is called on a position worth less than $5:
-- No Binance API call is made (it would fail anyway)
-- Position is cleared from state immediately
-- Trade is not logged (no real transaction occurred)
+| Action | Description |
+|--------|-------------|
+| `SIGNAL_SELL` | RSI/MACD/OB sell passed the sell guard |
+| `EARLY_FAILURE` | Lost signal conviction (`effective < threshold − 1.5`) |
+| `HARD_STOP` | Dynamic stop price hit |
+| `TRAIL_STOP` | Trailing stop triggered |
+| `TIME_STOP` | Hold time limit with insufficient gain |
+| `MAX_HOLD_EXIT` | Absolute maximum hold time exceeded |
+| `TP1_FULL_EXIT` | TP1 partial triggered (50% close) |
+| `FORCE SELL` | Discord Abandon button |
+| `EARLY_STAGNATION` | Early stagnation exit (position showed no progress) |
 
 ---
 
-## 8. Adaptive Signal Weights
+## 8. Position Sizing
 
-After accumulating **20+ completed trades**, the bot begins learning which signals actually predict profitable outcomes.
+### Base Size Formula
+
+```
+trade_size = portfolio_total_usdt × TRADE_SIZE_PCT (3%)
+           × size_modifier           (regime-based, from signal_weights)
+           × correlation_modifier    (0.5× if correlated coin already held)
+           × btc_cluster_modifier    (1.0 currently — hook for future use)
+           × crash_modifier          (0.25× if BTC crash active)
+           × downtrend_modifier      (0.8× if trend == "downtrend")
+           × vol_adj                 (Phase 4: inverse volatility, see below)
+```
+
+### Phase 4 — Inverse Volatility Sizing (Risk Parity)
+
+Making the stop-loss dynamic (0.5%–2.0%) would create variable dollar risk per trade if position size were fixed. The inverse-volatility adjustment normalises this:
+
+```
+atr_sl_pct = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, ps.atr_pct × ATR_SL_MULTIPLIER × 100))
+vol_adj    = STOP_LOSS_PCT / atr_sl_pct     (always ≤ 1.0)
+trade_size × vol_adj
+```
+
+**Effect:** Dollar loss per losing trade stays constant regardless of market regime.
+
+| ATR | SL | vol_adj | $30 base → |
+|-----|----|---------|------------|
+| 0.3% | 0.50% (floor) | 1.00 | $30.00 |
+| 0.5% | 0.75% | 0.67 | $20.00 |
+| 0.8% | 1.20% | 0.42 | $12.50 |
+| 1.3%+ | 2.00% (cap) | 0.25 | $7.50 |
+
+Capped by `MAX_POSITION_PCT` (10% of portfolio) and floored by `MIN_TRADE_NOTIONAL` ($20).
+
+---
+
+## 9. Adaptive Signal Weights
+
+After **20+ completed trades**, the bot learns which signals predict profitable outcomes.
 
 ### Learning Algorithm
 
-Every 5 minutes (`PORTFOLIO_REBALANCE_INTERVAL`), the bot:
-
-1. Loads the last 300 completed SELL trades from the DB
-2. For each signal, checks whether it was active at entry time
-3. Scores each trade as:
+Every 5 minutes, the bot:
+1. Loads the last 300 completed SELL trades
+2. For each signal, checks whether it was active at entry
+3. Scores each trade:
 
 | Outcome | Score |
 |---------|-------|
@@ -495,88 +572,67 @@ Every 5 minutes (`PORTFOLIO_REBALANCE_INTERVAL`), the bot:
 | Scratch (~0%) | 0.0 |
 | Loss | −1.0 |
 
-4. Applies **exponential decay** (`0.95^i`) so recent trades matter more than old ones
-5. Maps the average outcome score to a weight in range `[0.5, 1.5]`
+4. Applies **exponential decay** (`0.95^i`) — recent trades matter more
+5. Maps average outcome to weight in `[0.5, 1.5]`
 
 ### Stability Controls
 
-| Control | Value | Purpose |
-|---------|-------|---------|
-| Inertia blend | 70% old + 30% new | Prevents sudden jumps from a few bad trades |
-| Max delta per cycle | ±0.2 | Hard clamp on how fast any weight can shift |
-| Min trades | 20 | Weights stay at 1.0 until enough history exists |
-| Normalization | 2% decay toward 1.0 per cycle | Prevents long-term drift in 24/7 markets |
+| Control | Value |
+|---------|-------|
+| Inertia blend | 70% old + 30% new |
+| Max delta per cycle | ±0.2 |
+| Min trades before diverging | 20 |
+| Normalization decay | 2% toward 1.0 per cycle |
 
 ### Drawdown Mode
 
-During portfolio drawdown, the weight learner:
-- Filters to **winning trades only** (ignores loss trades to avoid overreacting)
-- Reduces inertia to 90% old / 10% new (much slower adaptation)
-- If fewer than 5 winning trades available, keeps current weights unchanged
+During portfolio drawdown: winners-only mode, inertia 90/10, minimum 5 winning trades required.
 
 ---
 
-## 9. Portfolio Management
+## 10. Portfolio Management
 
 ### Capital Allocation
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| Portfolio reserve | 50% | Half of total capital is never deployed |
-| Trade size | 3% per trade | Each buy = 3% of total portfolio value |
-| Max position | 10% per coin | No single coin can exceed 10% of portfolio |
-| Max concurrent trades | 3 | At most 3 open positions at any time |
-
-On a $82,000 portfolio:
-- Reserve: ~$41,000 never touched
-- Trade size: ~$1,640 per entry
-- Max in any coin: ~$8,200
-
-### Portfolio Value Calculation
-
-```
-total_value = usdt_balance + Σ(asset_balance × current_price for all pairs)
-```
-
-Recalculated on **every WebSocket price tick** — P/L is always live, not delayed.
+| Portfolio reserve | 50% | Half of capital never deployed |
+| Trade size | 3% per trade | Each buy = 3% of total portfolio (before vol_adj) |
+| Max position | 10% per coin | No single coin > 10% of portfolio |
+| Max concurrent trades | 3 | At most 3 open positions |
 
 ### Drawdown Mode
 
 ```
-if portfolio_current_value < portfolio_peak_value × (1 - 5%):
+if portfolio_current_value < portfolio_peak_value × (1 − 5%):
     in_drawdown = True
-    → buy threshold += 0.5  (harder to enter)
-    → trade size × 0.5      (half position sizes)
-    → signal weight learner switches to winners-only mode
+    → buy threshold += 0.5
+    → trade size × 0.5
+    → signal weight learner: winners-only mode
 ```
-Drawdown mode automatically deactivates when the portfolio recovers above the trigger.
+
+Auto-deactivates when portfolio recovers above trigger.
 
 ### Rebalancing
 
-Every 5 minutes, `rebalance()` recalculates:
-- `usdt_reserved = total_portfolio × 50%`
-- `trade_amount_usdt = total_portfolio × 2%` per pair
+Every 5 minutes: recalculates `usdt_reserved`, `trade_amount_usdt`, updates `portfolio_current_value` from live prices.
 
 ---
 
-## 10. BTC Crash Filter
-
-Monitors BTC's 15-minute price change. When BTC drops sharply:
+## 11. BTC Crash Filter
 
 ```
-if BTC 15m change < -2.0%:
+if BTC 15m price change < −2.0%:
     btc_crash_active = True  (lasts 15 minutes)
     → buy threshold += 1.0 for ALL pairs
-    → trade size × 0.25 for ALL pairs (25% of normal)
+    → trade size × 0.25 for ALL pairs
 ```
 
-This is a **market-wide risk-off mode**. When BTC dumps -2% in 15 minutes, cascading liquidations typically drag all altcoins down with it. The filter reduces exposure across every pair while the storm passes.
-
-After 15 minutes (`BTC_CRASH_COOLDOWN = 900s`), normal mode resumes automatically.
+After `BTC_CRASH_COOLDOWN` (900s), normal mode resumes automatically.
 
 ---
 
-## 11. Correlation System
+## 12. Correlation System
 
 ### Correlation Groups
 
@@ -585,202 +641,271 @@ After 15 minutes (`BTC_CRASH_COOLDOWN = 900s`), normal mode resumes automaticall
 {"BNB", "SUI"}           # Binance ecosystem
 ```
 
-When entering a position in a correlated asset that's already moving in the same direction as an existing position in the same group, trade size is **halved**:
-
+When entering a correlated asset already moving in the same direction as an existing position in the same group:
 ```
-if correlated_asset has open position AND same direction:
-    trade_size × 0.5
+trade_size × 0.5
 ```
-
-This prevents doubling down on the same macro move with two separate trades.
-
-### BTC Cluster Size Modifier (Altcoins)
-
-`get_btc_cluster_size_modifier()` returns a trade-size multiplier for altcoins (BNB, SUI, XRP). Currently returns `1.0` (pass-through) — the hook exists for future implementation of cluster-aware sizing.
 
 ---
 
-## 12. Discord Control Panel
+## 13. Market Dynamics Engine
 
-The Discord bot posts a **live panel** in the `#trading-bot` channel, auto-refreshing every **10 seconds**.
+`market_data.py` provides two components that all signal pollers share.
+
+### DataProvider — Kline Cache
+
+A 60-second TTL cache for kline (OHLCV) data, keyed by `"{pair}_{interval}"`.
+
+- `fetch_technical_indicators()` and `detect_fvg()` both accept an optional `data_provider` argument
+- When provided, klines are served from cache; only one REST call is made per pair per 60s regardless of how many tasks poll simultaneously
+- On network failure, returns the last valid cached data (stale-on-error)
+- Warm-up: on startup, cache is pre-populated for all pairs before the main loop begins
+
+### VolumePairList
+
+Ranks all USDT pairs by 24-hour quote volume and keeps the top-N most liquid. Refreshes every 5 minutes via `market_dynamics_loop()`.
+
+- Uses `get_ticker()` endpoint (single REST call for all pairs)
+- Sorted by `quoteVolume` descending
+- Ensures the bot always trades the highest-liquidity USDT pairs
+
+### Module-level Singletons
+
+```python
+data_provider   # DataProvider instance, wired into all indicator fetches
+volume_pairlist # VolumePairList instance, updated by market_dynamics_loop
+```
+
+---
+
+## 14. Long-Term Portfolio Layer
+
+A separate "macro hold" strategy running in `long_term_loop()` alongside the scalper. Completely independent of scalp state.
+
+- **Separate capital**: `LongTermState` per pair holds quantity, entry price, and position state distinct from `PairState`
+- **Entry**: requires sustained trend and effective score above `LONG_TERM_ENTRY_THRESHOLD`
+- **No TP1 / no trailing / no stagnation exits** — holds through noise
+- **Exit**: sustained downtrend (`consecutive_downtrend_cycles` counter) or effective score collapse
+- **Triple-long protection**: `FUTURES_TRIPLE_LONG_BLOCK = True` — if spot scalper AND long-term both hold a coin AND futures paper holds a LONG on the same coin, the futures LONG is blocked
+- **Enabled**: `LONG_TERM_ENABLED` in config
+
+---
+
+## 15. Futures Paper Trading Layer
+
+`futures_paper.py` adds **fully simulated** SHORT and LONG positions. No real Binance futures orders are placed. Completely isolated from spot P/L.
+
+### Overview
+
+| Feature | Value |
+|---------|-------|
+| Leverage | 2× (simulated) |
+| Position size | Up to $20 notional (ATR-sized) |
+| Max concurrent | 2 positions |
+| Funding fee | 0.01% per 8-hour interval (simulated) |
+| Round-trip cost | 0.30% (deducted at exit) |
+
+### When to SHORT vs LONG
+
+| Side | Required | Blocked during |
+|------|----------|----------------|
+| SHORT | `trend == "downtrend"` | `trending_volatile` regime |
+| LONG | `trend == "uptrend"` | `choppy_volatile` regime |
+
+### Bearish Score for SHORT Entry
+
+```
+score = 0.0
++ min(abs(structure_score), 1.5)    if structure_score < 0   (bearish PA)
++ 0.8                               if RSI > RSI_SELL_THRESHOLD (overbought)
++ 0.6                               if macd_crossover == "bearish"
++ 0.3                               if trend == "downtrend"     (confirmation bonus)
++ 0.5                               if ob < FUTURES_OB_BEAR_MAX (0.45)
++ 0.5                               if flow < FUTURES_FLOW_BEAR_MAX (0.45)
+```
+
+Minimum score: `FUTURES_MIN_SCORE = 1.5` (regime-adjusted: 1.2 in ranging, 1.8 in volatile).
+
+Without RSI overbought (typical in sustained downtrends where RSI stays 35–55), a realistic confluence:
+```
+structure_score (−0.5) → +0.5
+trend confirmation      → +0.3
+ob = 0.43               → +0.5
+flow = 0.43             → +0.5
+total = 1.8  ✓          (above 1.5 threshold)
+```
+
+### Entry Gate (all must pass for SHORT)
+
+1. `FUTURES_PAPER_ENABLED` and `FUTURES_SHORT_ENABLED`
+2. No open position on this symbol
+3. ATR move expected ≥ `FUTURES_MIN_REWARD_PCT` (0.50%)
+4. No re-entry cooldown from recent failed exit
+5. Last candle not abnormally wide (< 2.5× ATR)
+6. `trend == "downtrend"`
+7. `regime != "trending_volatile"`
+8. `ob < 0.45` AND `flow < 0.45` (both bearish)
+9. `macd_histogram < 0.0` (negative momentum)
+10. `score ≥ dynamic_min_score`
+11. Open positions < `FUTURES_MAX_CONCURRENT_POSITIONS` (2)
+
+### Exits
+
+| Exit type | Condition |
+|-----------|-----------|
+| Hard stop | `pnl_pct < −FUTURES_HARD_STOP_PCT (0.60%)` |
+| Trailing stop | Activated after 1.5% profit; trails 0.8% |
+| TP1 partial | `pnl_pct ≥ FUTURES_TP1_PCT (0.50%)` → close 50% |
+| Signal reversal | Bullish MACD cross or ob/flow both flip bullish (while in profit) |
+| Stagnation T1 | 12h elapsed, still losing > 1.0% |
+| Stagnation T2 | 24h elapsed, still losing > 0.5% |
+| Time stop | 72h absolute max hold |
+
+### ATR-Based Position Sizing
+
+```
+dollar_risk  = portfolio_value × FUTURES_RISK_PCT_PER_TRADE (0.5%)
+stop_pct     = atr_pct × FUTURES_ATR_STOP_MULT (2.0)
+notional     = max($5, min($20, dollar_risk / stop_pct))
+```
+
+### P/L Accounting
+
+```
+SHORT pnl_pct = (entry − current) / entry × 100 × leverage
+LONG  pnl_pct = (current − entry) / entry × 100 × leverage
+
+net_pl = gross_pl − round_trip_cost (0.30%) − accrued_funding_fees
+```
+
+Tracked separately in `state.futures_paper_realized_pnl`, `futures_paper_total_trades`, `futures_paper_winning_trades`.
+
+---
+
+## 16. Discord Control Panel
+
+Auto-refreshes every **45 seconds**.
 
 ### Panel Contents
 
-**GROWTH section:**
-- Start value, current value, total P/L (USDT + %), peak value, max drawdown, uptime
+**GROWTH section:** Start value, current value, total P/L (USDT + %), peak value, max drawdown, uptime
 
-**PER COIN section (all pairs):**
-- Asset balance, entry price, current price, position value, P/L per coin
+**PER COIN section:** Asset balance, entry price, current price, position value, P/L per coin
 
-**HOLDING section (open positions):**
-- Full detail per open position: regime, effective score, signal breakdown (BOS/Sweep/Vol/RSI/Trend), quantity, entry, held time, P/L, stop-loss, trailing stop
+**HOLDING section:** Full detail per open position — regime, effective score, signal breakdown, quantity, entry, held time, P/L, current stop-loss (dynamic), trailing stop
 
-**WATCHING section (no position):**
-- Summary per idle pair: regime, `Eff: X.X / Th: X.X`, signal breakdown (BOS/Sweep/Vol/RSI), OB/Flow, trend
-- Status shows `READY ✓`, `HOLD (need +X.X)`, `BLOCKED (reason)`, or `READY but BLOCKED (reason)` — the last case means strategy approved BUY but execution would still reject it (e.g. cooldown, no capital)
-- Block reason is computed by the same `_entry_block_reason()` logic as `execute_buy()`, keeping panel and execution permanently aligned
+**WATCHING section:** Idle pairs — regime, `Eff: X.X / Th: X.X`, signal breakdown, OB/Flow, trend.
+Status: `READY ✓`, `HOLD (need +X.X)`, `BLOCKED (reason)`, or `READY but BLOCKED (reason)`
 
-**MARKET STATE:**
-- Fear & Greed score + label
-- BTC crash filter status
-- Drawdown mode status
+**FUTURES PAPER section:** Open futures positions with side, entry, current P/L, trailing stop, funding accrued. Realized P/L, win rate.
 
-**USDT section:**
-- Available balance, reserved amount, total trades, win rate
+**MARKET STATE:** Fear & Greed, BTC crash filter, drawdown mode
+
+**USDT section:** Available balance, reserved, total trades, win rate
 
 ### Buttons
 
 | Button | Action |
 |--------|--------|
-| ⏸ Pause / ▶ Resume | Toggle trading (signals still update, no new orders placed) |
-| 📊 Signals | Select a pair → detailed signal card with all raw values |
-| 📈 Chart | Select a pair → candlestick chart image with BUY/SELL markers |
-| 💼 Portfolio | Full portfolio breakdown embed |
+| ⏸ Pause / ▶ Resume | Toggle trading (signals still update) |
+| 📊 Signals | Pair selector → detailed signal card |
+| 📈 Chart | Pair selector → candlestick chart with trade markers |
+| 💼 Portfolio | Full portfolio breakdown |
 | 📜 Trades | Last 10 completed trades with P/L |
-| ⚙️ Config | Current config values (thresholds, intervals, mode) |
-| 🗑️ Abandon | Force-sell a position — places a real market sell order regardless of P/L. Falls back to state-clear if position is below Binance's minimum notional ($5). Shows all open positions with current P/L before asking for confirmation. |
-| 📊 Exit Analytics | Per-action exit breakdown: count, win%, avg P/L, total P/L for every sell action type (SIGNAL_SELL, EARLY_FAILURE, HARD_STOP, TRAIL_STOP, TIME_STOP, etc.) |
+| ⚙️ Config | Current config values |
+| 🗑️ Abandon | Force-sell a position (real market order, or state-clear if dust < $5) |
+| 📊 Exit Analytics | Per-action exit breakdown: count, win%, avg P/L, total P/L |
 
-### Owner Lock
-
-All buttons check `interaction.user.id == DISCORD_OWNER_ID` before responding. Non-owners see a permission denied message.
-
-### Abandon / Force Sell Flow
-
-```
-Click 🗑️ Abandon
-    → Shows buttons for each open position (label = "BTC +2.7%", colour = red if loss)
-    → Click a coin → confirmation card showing: qty, value, entry, P/L, dust warning if < $5
-    → Click ✅ Confirm Sell → execute_sell() called with note="FORCE SELL"
-        → If value ≥ $5: real Binance market sell order placed
-        → If value < $5 (dust): state cleared locally, no API call
-    → Click ❌ Cancel → nothing happens, view expires in 30s
-```
+All buttons locked to `DISCORD_OWNER_ID`.
 
 ---
 
-## 13. Web Dashboard
+## 17. Web Dashboard
 
-A FastAPI + uvicorn server runs embedded in the main bot process, serving a real-time trading terminal at `http://localhost:8000`.
+FastAPI + uvicorn server embedded in the main bot process at `http://localhost:8081`.
 
-### Features
-
-- **TradingView Lightweight Charts v4.1.1** — professional candlestick chart with volume bars
-- **300 candles** loaded on startup, auto-scroll to latest
+- **TradingView Lightweight Charts v4.1.1** — candlestick + volume bars
+- **300 candles** on load, auto-scroll to latest
 - **Watchlist** — all pairs with live prices, colour-coded by trend
-- **Signal panel** — live effective score, individual signal status, regime label
+- **Signal panel** — effective score, individual signal status, regime
 - **Portfolio sidebar** — P/L, drawdown, win rate
-- Live data via WebSocket push from the bot's state
+- Live updates via WebSocket push from bot state
 
 ---
 
-## 14. Database & Logging
+## 18. Database & Logging
 
-All trade history is stored in **`trades.db`** (SQLite).
+All trade history in **`trades.db`** (SQLite, **WAL journal mode** — crash-safe writes).
 
 ### Tables
 
 | Table | Contents |
 |-------|---------|
-| `trades` | Every BUY and SELL: pair, price, qty, USDT, RSI, F&G, confidence, P/L, regime, ATR, signal snapshot (JSON), outcome_label, hold_minutes, confidence_weighted |
-| `portfolio_snapshots` | Portfolio value + P/L saved every 30 minutes |
-| `bot_state` | Full bot state (serialised JSON) — id=1, one row, replaced on save |
-| `pair_states` | Per-pair state (serialised JSON), keyed by pair symbol — restored on restart |
+| `trades` | Every BUY/SELL: pair, price, qty, USDT, RSI, confidence, P/L, regime, ATR, signal snapshot (JSON), outcome_label, hold_minutes |
+| `portfolio_snapshots` | Portfolio value + P/L every 30 minutes |
+| `bot_state` | Full serialised BotState (id=1, replaced on save) |
+| `pair_states` | Per-pair serialised state, keyed by symbol |
 
-### Sell Action Taxonomy in DB
+### WAL Mode
 
-All exit trades are identified by their `action` column. The canonical set (`_ALL_SELL_ACTIONS` in `logger.py`) covers:
+All connections (`logger.py`, `state.py`, `panel.py`) open with `PRAGMA journal_mode=WAL`. This makes every write atomic — a process crash or VPS reboot mid-write cannot corrupt the database. On restart, `load_state_from_db()` reliably recovers all open positions, entry prices, trailing stops, and TP1 status.
+
+### Exit Action Taxonomy (`_ALL_SELL_ACTIONS`)
 
 ```
 SELL, STOP_LOSS, SIGNAL_SELL, EARLY_FAILURE, HARD_STOP, TRAIL_STOP,
-TIME_STOP, MAX_HOLD_EXIT, TP1_FULL_EXIT, FORCE SELL
+TIME_STOP, MAX_HOLD_EXIT, TP1_FULL_EXIT, FORCE SELL, EARLY_STAGNATION,
+FUTURES_SHORT_ENTRY, FUTURES_LONG_ENTRY, FUTURES_TP1, FUTURES_SIGNAL_EXIT,
+FUTURES_TRAIL_STOP, FUTURES_HARD_STOP, FUTURES_EARLY_STAGNATION, FUTURES_TIME_STOP
 ```
-
-Any query filtering for "exit trades" must use this full set, not just `('SELL', 'STOP_LOSS')`. All DB helper functions in `logger.py` (`get_trade_stats`, `get_trade_summary`, `get_trades_with_snapshots`, `get_exit_analytics`) use parameterized queries against `_ALL_SELL_ACTIONS`.
-
-### Exit Analytics
-
-`get_exit_analytics()` returns a breakdown per action type:
-
-```python
-{
-    "total_exits": 42,
-    "by_action": {
-        "SIGNAL_SELL": {"count": 18, "wins": 12, "total_pl": 34.50, "avg_pl": 1.92},
-        "HARD_STOP":   {"count":  8, "wins":  0, "total_pl": -28.40, "avg_pl": -3.55},
-        ...
-    }
-}
-```
-
-Used by `build_exit_analytics_embed()` in the Discord panel.
 
 ### Signal Snapshots
 
-Every trade stores the full signal state at entry as a JSON blob:
-```json
-{
-  "rsi": 1.0, "macd": 0.0, "bollinger": 1.0,
-  "fear_greed": 0.72, "volume": 0.0, "whale": 1.0, "gas": 0.0, "trends": 0.0,
-  "raw_rsi": 38.4, "raw_macd_hist": -0.0012, "raw_bb_position": "below_lower",
-  "raw_fear_greed": 28, "raw_google_trend": 62, "raw_whale": "neutral",
-  "raw_volume_spike": false, "raw_gas": 0
-}
-```
-
-This snapshot is what the adaptive weight learner reads to correlate signal states with trade outcomes.
-
-### State Persistence
-
-The full `BotState` (all pair states, balances, positions, signal weights) is saved to `trades.db` after every trade and every 30-minute snapshot. On restart, the bot reloads all state — open positions, entry prices, trailing stops, TP1 status — so nothing is lost across restarts.
+Every trade stores the full signal state at entry as a JSON blob — used by the adaptive weight learner to correlate signal states with outcomes.
 
 ---
 
-## 15. Configuration Reference
+## 19. Configuration Reference
 
-All values in `config.py`.
+All values in `config.py`. This is the single source of truth — edit here first, then update this document.
 
 ### Signal Thresholds
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `RSI_BUY_THRESHOLD` | 55 | RSI below this = buy signal (enter near neutral, more frequent) |
-| `RSI_SELL_THRESHOLD` | 70 | RSI above this = sell signal (overbought) |
-| `FEAR_GREED_BUY_MAX` | 65 | F&G at or below this = buy zone (trade through moderate optimism) |
+| `RSI_BUY_THRESHOLD` | 48 | RSI below this = buy signal |
+| `RSI_SELL_THRESHOLD` | 70 | RSI above this = sell signal |
+| `CONFIDENCE_BUY_THRESHOLD` | 2.0 | Base buy_score required to enter |
 | `VOLUME_SPIKE_MULTIPLIER` | 1.5× | Volume must be 1.5× average to count as spike |
-| `CONFIDENCE_BUY_THRESHOLD` | 3 | Base buy_score required to buy |
+| `FEAR_GREED_BUY_MAX` | 65 | F&G at or below this = buy zone |
 
 ### Stop-Loss & Take-Profit
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `STOP_LOSS_PCT` | 1.0% | Hard stop — exit if price drops 1% from entry |
-| `ATR_TRAILING_MULTIPLIER` | 2.0× | Trailing stop = entry − ATR × 2.0 |
-| `ATR_TP_MULTIPLIER` | 2.5× | ATR take-profit = entry + ATR × 2.5 |
-| `ATR_TRAIL_ACTIVATION_PCT` | 0.8% | Trailing stop only activates after +0.8% gain |
+| `STOP_LOSS_PCT` | 0.5% | Dynamic SL floor — minimum SL regardless of ATR |
+| `ATR_SL_MULTIPLIER` | 1.5× | SL widens to `ATR% × 1.5` in volatile markets |
+| `ATR_SL_MAX_PCT` | 2.0% | Hard cap on dynamic SL |
+| `ATR_TRAILING_MULTIPLIER` | 1.5× | Pre-TP1 ATR trailing stop multiplier |
+| `ATR_TP_MULTIPLIER` | 2.0× | ATR take-profit distance for R/R calculation |
+| `ATR_TRAIL_ACTIVATION_PCT` | 0.25% | Pre-TP1 trail activates after +0.25% gain |
 | `ATR_MAX_TRAIL_PCT` | 2.0% | Max trail distance once activated |
+| `BASE_TP1_PCT` | 0.6% | TP1 threshold — sell 50% at +0.6% |
+| `TP1_SELL_RATIO` | 0.5 | 50% of position closed at TP1 |
+| `BREAKEVEN_BUFFER_PCT` | 0.20% | Stop moved to entry +0.20% after TP1 hits |
+| `TRAILING_ACTIVATION_PCT` | 0.6% | Post-TP1 tight trail activates after +0.6% |
+| `TRAILING_DISTANCE_PCT` | 0.25% | Post-TP1 trail distance below current price |
 
-### Scalping Parameters
+### Scalping / Time Exits
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `SCALP_MICRO_TP_PCT` | 0.3% | Micro TP — full exit unless BOTH volume AND MACD bullish |
-| `SCALP_SOFT_TP_PCT` | 0.5% | Soft TP if neither MACD nor volume alive |
-| `SCALP_HARD_TP_PCT` | 1.0% | Hard take-profit ceiling |
-| `SCALP_SMALL_PROFIT_LOW` | 0.2% | Small profit lock — lower bound |
-| `SCALP_SMALL_PROFIT_HIGH` | 0.4% | Small profit lock — upper bound |
-| `SCALP_EARLY_STAG_MINUTES_T1` | 5 min | Stagnation Tier 1: kill at 5min if P/L < 0.1% |
-| `SCALP_EARLY_STAG_MIN_PCT_T1` | 0.10% | Stagnation Tier 1: minimum P/L threshold |
-| `SCALP_EARLY_STAG_MINUTES` | 8 min | Stagnation Tier 2: kill at 8min if P/L < 0.15% |
-| `SCALP_EARLY_STAG_MIN_PCT` | 0.15% | Stagnation Tier 2: minimum P/L threshold |
-| `SCALP_SOFT_HOLD_MINUTES` | 12 min | Exit if P/L < 0.3% after 12 minutes |
-| `SCALP_HARD_HOLD_MINUTES` | 20 min | Absolute max hold time |
-| `SCALP_STAGNATION_MIN_PCT` | 0.3% | Required P/L at soft hold time |
+| `HARD_EXIT_MINUTES_BASE` | 20 min | Time stop base — exit if gain ≤ 0.15% after 20min |
+| `HARD_EXIT_PL_THRESHOLD_PCT` | 0.15% | Minimum P/L required to avoid time stop |
+| `SCALP_HARD_TP_PCT` | 1.2% | Hard TP ceiling for strong winners |
+| `SCALP_SMALL_PROFIT_LOW` | 0.40% | Small profit lock lower bound |
+| `SCALP_SMALL_PROFIT_HIGH` | 0.60% | Small profit lock upper bound |
 | `MAX_CONCURRENT_TRADES` | 3 | Max simultaneous open positions |
-| `BASE_TP1_PCT` | 0.3% | Micro TP threshold (previously partial TP1 at 0.75%) |
-| `TP1_SELL_RATIO` | 100% | Full exit at micro TP (no partial sells) |
-| `TRAILING_ACTIVATION_PCT` | 0.5% | Activate trailing stop after +0.5% gain |
-| `TRAILING_DISTANCE_PCT` | 0.15% | Trailing distance below current price |
 | `MIN_TRADE_NOTIONAL` | $20 | Hard floor — no orders below $20 USDT |
 
 ### Portfolio
@@ -788,11 +913,10 @@ All values in `config.py`.
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
 | `PORTFOLIO_RESERVE_PCT` | 50% | Fraction of portfolio never deployed |
-| `TRADE_SIZE_PCT` | 3% | Trade size as % of total portfolio |
+| `TRADE_SIZE_PCT` | 3% | Base trade size as % of total portfolio |
 | `MAX_POSITION_PCT` | 10% | Max allocation per coin |
-| `DRAWDOWN_TRIGGER_PCT` | 5.0% | Drawdown % from peak that triggers risk reduction |
+| `DRAWDOWN_TRIGGER_PCT` | 5.0% | Drawdown % from peak triggers risk reduction |
 | `DRAWDOWN_THRESHOLD_BOOST` | +0.5 | Extra score required during drawdown |
-| `DRAWDOWN_SIZE_REDUCTION` | 0.5× | Half position sizes during drawdown |
 
 ### BTC Crash Filter
 
@@ -801,75 +925,73 @@ All values in `config.py`.
 | `BTC_CRASH_PCT` | −2.0% | 15m change below this triggers crash mode |
 | `BTC_CRASH_THRESHOLD_BOOST` | +1.0 | Extra score required during crash |
 | `BTC_CRASH_SIZE_MULTIPLIER` | 0.25× | 25% position size during crash |
-| `BTC_CRASH_COOLDOWN` | 900s | Stay in risk-off for 15 min after crash |
+| `BTC_CRASH_COOLDOWN` | 900s | Risk-off duration after crash trigger |
 
-### Adaptive Weights
+### Futures Paper
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `SIGNAL_WEIGHT_MIN` | 0.5 | Floor weight for any signal |
-| `SIGNAL_WEIGHT_MAX` | 1.5 | Ceiling weight for any signal |
-| `SIGNAL_WEIGHT_WINDOW` | 300 trades | Rolling learning window |
-| `SIGNAL_WEIGHT_MIN_TRADES` | 20 | Min trades before weights diverge from 1.0 |
-| `SIGNAL_WEIGHT_DECAY` | 0.95 | Exponential decay per trade (recent = more important) |
-| `SIGNAL_WEIGHT_NORMALIZE_RATE` | 2% | Per-cycle decay toward 1.0 |
+| `FUTURES_PAPER_ENABLED` | True | Master switch |
+| `FUTURES_SHORT_ENABLED` | True | Allow simulated SHORTs |
+| `FUTURES_LONG_ENABLED` | True | Allow simulated LONGs |
+| `FUTURES_MAX_LEVERAGE` | 2.0× | Simulated leverage |
+| `FUTURES_POSITION_SIZE_USDT` | $20 | Max notional per position (ATR-sized) |
+| `FUTURES_MIN_SCORE` | 1.5 | Baseline entry score (1.2 ranging / 1.8 volatile) |
+| `FUTURES_HARD_STOP_PCT` | 0.60% | Max loss before forced exit |
+| `FUTURES_TP1_PCT` | 0.50% | First profit target |
+| `FUTURES_TP1_RATIO` | 0.50 | 50% closed at TP1 |
+| `FUTURES_TRAIL_ACTIVATION_PCT` | 1.5% | Trail activates after 1.5% profit |
+| `FUTURES_TRAIL_DISTANCE_PCT` | 0.8% | Trail distance |
+| `FUTURES_TIME_STOP_MINUTES` | 4320 | 72h absolute max hold |
+| `FUTURES_CHECK_INTERVAL` | 15s | Evaluation loop interval |
+| `FUTURES_FUNDING_RATE_PCT` | 0.01% | Simulated funding per 8h interval |
+| `FUTURES_ROUND_TRIP_COST_PCT` | 0.30% | Deducted at exit (taker fee simulation) |
 
 ### Trade Cooldown
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `TRADE_COOLDOWN_SECONDS` | 300s | Base cooldown between trades on same asset |
-| `TRADE_COOLDOWN_TRENDING` | 180s | Shorter cooldown in trending/trending_volatile regime |
-| `COOLDOWN_BYPASS_CONFIDENCE` | 5.0 | Bypass cooldown if `effective_score ≥ threshold + 5.0` AND regime in `COOLDOWN_BYPASS_REGIMES` |
-| `COOLDOWN_BYPASS_REGIMES` | trending, trending_volatile | Regimes where cooldown bypass is permitted |
+| `TRADE_COOLDOWN_SECONDS` | 300s | Base cooldown between trades on same pair |
+| `TRADE_COOLDOWN_TRENDING` | 180s | Shorter cooldown in trending regimes |
+| `COOLDOWN_BYPASS_CONFIDENCE` | 5.0 | Bypass if `eff ≥ threshold + 5.0` AND trending |
 
-### Entry Path Tuning
-
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `WICK_RATIO_THRESHOLD` | 0.6 | Upper wick fraction above this = exhaustion penalty (−1.0 buy_score) |
-| `MIN_EDGE_PCT` | 0.3% | ATR% below this = insufficient edge penalty (−0.8 buy_score) |
-| `SPREAD_MAX_PCT` | 0.15% | Max bid/ask spread — wider = execution blocker (live only) |
-| `SPIKE_FILTER_PCT` | 0.3% | Max single-tick price move — larger = execution blocker |
-| `NO_TRADE_ATR_PCT` | 0.003 | ATR% floor for dead-market gate (both must fail simultaneously) |
-| `NO_TRADE_TREND_PCT` | 0.001 | Trend strength floor for dead-market gate |
-
-### Orderbook / Flow Signals
+### Orderbook / Flow
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `OB_IMBALANCE_BULL` | 0.6 | Imbalance above this = bullish (buyers stacking) |
-| `OB_IMBALANCE_BEAR` | 0.4 | Imbalance below this = bearish gate / exit trigger |
-| `OB_FLOW_BULL` | 0.6 | Flow ratio above this = bullish (buyers lifting asks) |
-| `OB_FLOW_BEAR` | 0.4 | Flow ratio below this = bearish gate / exit trigger |
-| `OB_SCORE_BOOST` | 0.5 | Score added per bullish microstructure signal (max +1.0) |
-| `OB_EMA_ALPHA` | 0.3 | EMA smoothing alpha for imbalance and flow (~5-tick period) |
+| `OB_IMBALANCE_BULL` | 0.6 | Buyers stacking (bullish) |
+| `OB_IMBALANCE_BEAR` | 0.4 | Sellers stacking (bearish) |
+| `OB_FLOW_BULL` | 0.6 | Buyers lifting asks |
+| `OB_FLOW_BEAR` | 0.4 | Sellers hitting bids |
+| `OB_EMA_ALPHA` | 0.3 | Smoothing alpha (~5-tick period) |
 
 ### FVG Entry Controls
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `FVG_MIN_GAP_PCT` | 0.1% | Minimum gap size — smaller gaps are noise |
+| `FVG_MIN_GAP_PCT` | 0.1% | Minimum gap size |
 | `FVG_MAX_AGE_SECONDS` | 300s | Discard gaps older than one 5m candle |
-| `FVG_FAST_SCORE_MIN` | 2.0 | Minimum fast_score required for any FVG entry |
-| `FVG_OB_MIN` | 0.5 | Minimum orderbook imbalance required for FVG entry |
-| `FVG_EARLY_TP_PCT` | 0.25% | Accelerated take-profit for FVG-entry positions |
-| `FVG_COOLDOWN_SECONDS` | 300s | Minimum time between FVG trades on same pair |
-| `FVG_ORDER_TIMEOUT` | 60s | Cancel unfilled FVG limit order after this long |
+| `FVG_FAST_SCORE_MIN` | 2.0 | Minimum fast_score for FVG entry |
+| `FVG_OB_MIN` | 0.5 | Minimum orderbook imbalance for FVG entry |
+| `FVG_COOLDOWN_SECONDS` | 300s | Min time between FVG trades per pair |
+| `FVG_ORDER_TIMEOUT` | 60s | Cancel unfilled limit order after this |
 
 ### Polling Intervals
 
 | Signal | Interval |
 |--------|---------|
-| RSI / MACD / BB / ATR / Regime | 10s |
+| RSI / MACD / BB / ATR / Regime (REST fallback) | 10s |
+| RSI / MACD / BB / ATR / Regime (kline-close WebSocket) | On candle close (~3m) |
+| Orderbook imbalance + trade flow | 10s |
 | CoinGecko volume | 60s |
 | FVG detection | 60s |
 | Whale Alert | 120s |
 | Etherscan gas | 300s |
 | Portfolio rebalance + weight update | 300s |
+| Market Dynamics (VolumePairList refresh) | 300s |
 | Google Trends | 900s |
 | Fear & Greed | 3600s |
-| Discord panel refresh | 10s |
+| Discord panel refresh | 45s |
 | Portfolio snapshot (DB) | 1800s |
 
 ---
@@ -877,62 +999,65 @@ All values in `config.py`.
 ## Appendix: Decision Flow Summary
 
 ```
-Every price tick (WebSocket):
+Every price tick (WebSocket → real_time_execution_worker):
 │
 ├─ HOLDING? ──────────────────────────────────────────────────────────────────┐
-│                                                                               │
-│  [bot.py — _get_forced_exit_reason]                                          │
-│   1.  HARD_STOP      price ≤ hard_stop_price → SELL                         │
-│   2.  TRAIL_STOP     price ≤ trailing_stop → SELL                           │
-│   3.  TIME_STOP      open ≥ hard_exit_min AND gain ≤ 0.15% → SELL          │
-│   4.  MAX_HOLD_EXIT  open ≥ hard_exit_min × 1.5 → SELL                     │
-│                                                                               │
-│  [bot.py — TP1 check]                                                        │
-│   5.  TP1_FULL_EXIT  gain ≥ tp1_pct → SELL (bypasses signal guard)          │
-│                                                                               │
-│  [strategy.py — signal exits, tagged sell_reason = "signal"]                 │
-│   6.  RSI > 70 → SELL                                                        │
-│   7.  MACD crossover == "bearish" → SELL                                     │
-│   8.  orderbook_imbalance < 0.4 → SELL                                       │
-│       (all three gated by _should_allow_signal_sell unless bypassed)         │
-│                                                                               │
-│  [strategy.py — scoring deterioration]                                       │
-│   9.  EARLY_FAILURE  raw_effective < threshold − 1.5 → SELL (bypasses guard)│
-│                                                                               │
-│   (none triggered) → fall through to BUY scoring                             │
-└──────────────────────────────────────────────────────────────────────────────┘
+│                                                                              │
+│  [bot.py — _get_forced_exit_reason]                                         │
+│   1. HARD_STOP     price ≤ dynamic_stop (ATR-scaled 0.5–2.0%) → SELL       │
+│   2. TRAIL_STOP    price ≤ trailing_stop → SELL                             │
+│   3. TIME_STOP     held ≥ 20min AND gain ≤ 0.15% → SELL                    │
+│   4. MAX_HOLD_EXIT held ≥ 30min → SELL                                      │
+│                                                                              │
+│  [bot.py — TP1 check]                                                       │
+│   5. TP1_FULL_EXIT gain ≥ 0.6% → sell 50%, move SL to breakeven+0.20%     │
+│                                                                              │
+│  [strategy.py — signal exits]                                               │
+│   6. RSI > 70 → SELL (signal)                                               │
+│   7. MACD crossover == "bearish" → SELL (signal)                           │
+│   8. orderbook_imbalance < 0.4 → SELL (signal)                             │
+│      (gated by _should_allow_signal_sell)                                   │
+│   9. EARLY_FAILURE  raw_effective < threshold − 1.5 → SELL (bypass guard)  │
+│                                                                              │
+│  (none triggered) → continue to scoring                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
 │
-├─ SCORING (strategy.py — all pairs whether holding or not):
+├─ SCORING (strategy.py):
 │
 │   raw_effective = confidence + structure_score + volatility_score
 │
 │   buy_score = raw_effective
-│             − 1.0  if wick_ratio > 0.6        (exhaustion)
-│             − 0.8  if ATR% < 0.3%             (min edge not met)
-│             − 1.0  if RR < 1.0                (bad risk/reward)
-│             − 0.5  if 1.0 ≤ RR < 1.20        (marginal R/R)
-│             − 1.0  if trend == "downtrend"    (counter-trend penalty)
-│             + 0.3  if trend == "uptrend"      (dip with trend boost)
+│             − 1.0  if wick_ratio > 0.6
+│             − 0.8  if ATR% < 0.3%
+│             − 1.0  if RR < 1.0
+│             − 0.5  if 1.0 ≤ RR < 1.20
+│             − 1.0  if trend == "downtrend"
+│             + 0.3  if trend == "uptrend"
 │             − 0.3  if regime == "choppy_volatile"
 │
-│   HARD blocks (strategy layer):
-│   - Dead market: ATR% < 0.3% AND trend_strength < 0.1% → HOLD
-│   - Concurrent cap: open_positions ≥ 3 (NOT holding) → HOLD
+│   HARD blocks: dead market (ATR+trend both low); concurrent cap (3 open)
 │
-│   if buy_score ≥ threshold → BUY
-│   else → HOLD
+│   if buy_score ≥ threshold → BUY candidate
 │
-├─ EXECUTION (bot.py — get_entry_block_reason, only if BUY):
+├─ EXECUTION GATE (bot.py — get_entry_block_reason):
 │
-│   1. add_blocked       holding + price below entry → skip
-│   2. cooldown          time since last trade < limit → skip
-│                        (bypass if eff ≥ threshold+5.0 AND trending regime)
-│   3. spike_filter      tick move > 0.3% → skip
-│   4. spread_filter     spread > 0.15% (live only) → skip
-│   5. insufficient_spendable  usdt_balance − reserved ≤ $1 → skip
-│   6. position_maxed    position ≥ 10% portfolio → skip
-│   7. min_notional      trade size < $20 → skip
-│   8. fvg_cooldown      FVG trade within 300s → skip
+│   1. add_blocked         holding + price below entry
+│   2. cooldown            time since last trade < limit
+│   3. failed_exit_cooldown recent forced-exit on this pair
+│   4. spike_filter        tick move > 0.3%
+│   5. unstable_candle     candle range > 2.5× ATR
+│   6. spread_filter       spread > 0.15% (live only)
+│   7. insufficient_spendable usdt_balance − reserved ≤ $1
+│   8. position_maxed      position ≥ 10% portfolio
+│   9. min_notional        ATR-vol-adjusted trade size < $20
+│  10. fvg_cooldown        FVG trade within 300s
 │
 │   (no blocker) → place BUY order
+│
+│   Size = portfolio × 3%
+│         × regime/correlation/crash/downtrend modifiers
+│         × vol_adj (STOP_LOSS_PCT / effective_sl_pct)   ← Phase 4
+│
+└─ (parallel, on 3m candle close via WebSocket):
+    poll_rsi_on_close() → immediate full indicator recalc at T+0
 ```
