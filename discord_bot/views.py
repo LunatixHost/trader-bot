@@ -279,6 +279,50 @@ class AbandonSelectView(OwnerOnlyView):
         return callback
 
 
+# ─── Futures Kill Switch ──────────────────────────────────────────────────────
+
+class FuturesKillSwitchView(OwnerOnlyView):
+    """Danger button attached to every futures SIGNALS notification.
+
+    Clicking FORCE CLOSE calls execute_futures_exit() with reduceOnly=True —
+    the same path used by normal SL/TP exits, so it cannot open a reversal.
+    Button is disabled after one press or when the interaction times out.
+    """
+
+    def __init__(self, symbol: str, side: str):
+        super().__init__(timeout=3600)   # live for 1 hour
+        self.symbol = symbol
+        self.side   = side               # 'long' | 'short'
+
+    @discord.ui.button(
+        label="⛔ FORCE CLOSE",
+        style=discord.ButtonStyle.danger,
+        custom_id="futures_force_close",
+    )
+    async def force_close(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        btn.disabled = True
+        btn.label    = "Closing…"
+        await interaction.response.edit_message(view=self)
+
+        try:
+            from futures_execution import execute_futures_exit
+            await execute_futures_exit(self.symbol, self.side, None)  # None = full close
+            await interaction.followup.send(
+                f"✅ Emergency close sent for **{self.symbol}** ({self.side.upper()}). "
+                f"Check Binance to confirm fill.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            btn.label = "⛔ FORCE CLOSE"
+            btn.disabled = False
+            await interaction.followup.send(
+                f"❌ Close failed: `{e}`",
+                ephemeral=True,
+            )
+        finally:
+            self.stop()
+
+
 class AbandonConfirmView(OwnerOnlyView):
     def __init__(self, state, pair: str, execute_sell_callback=None):
         super().__init__(timeout=30)

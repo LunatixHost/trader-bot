@@ -9,7 +9,8 @@ import hashlib
 import logging
 import time
 import discord
-from discord.ext import tasks
+from discord import app_commands
+from discord.ext import commands, tasks
 from config import (
     DISCORD_BOT_TOKEN, DISCORD_CHANNELS,
     INTERVAL_DISCORD_PANEL,
@@ -18,9 +19,10 @@ from discord_bot.panel import (
     build_main_panel, build_audit_panel, build_equity_panel,
     build_admin_panel, build_trade_notification,
 )
-from discord_bot.views import MainView
+from discord_bot.views import MainView, FuturesKillSwitchView
 from discord_bot.chart import generate_chart
 from logger import get_trades_for_pair
+from alert_router import alert_router
 
 # Force a full refresh at least this often so the "Updated <t:...>" timestamp
 # in the panel header stays reasonably current even in a flat market.
@@ -104,8 +106,8 @@ _PANEL_BUILDERS = {
 }
 
 
-class TradingDiscordBot(discord.Client):
-    """Discord client — multi-channel terminal architecture.
+class TradingDiscordBot(commands.Bot):
+    """Discord bot — multi-channel terminal architecture with slash commands.
 
     Channels:
       MAIN    — active positions + full button controls
@@ -113,13 +115,15 @@ class TradingDiscordBot(discord.Client):
       AUDIT   — entry block diagnostic (read-only live panel)
       EQUITY  — PnL accounting (read-only live panel)
       ADMIN   — system health (read-only live panel)
+
+    Slash commands: /status  /portfolio  /pause  /resume  /close
     """
 
     def __init__(self, state):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
-        super().__init__(intents=intents)
+        super().__init__(command_prefix="!", intents=intents)
         self.state = state
 
         # Per-channel Discord objects (populated in _setup_channels)
@@ -138,10 +142,173 @@ class TradingDiscordBot(discord.Client):
 
     async def setup_hook(self):
         self.refresh_panels.start()
+        self.consume_alerts.start()
+        self._register_slash_commands()
 
     async def on_ready(self):
         logger.info(f"Discord bot logged in as {self.user}")
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Slash commands synced: {[c.name for c in synced]}")
+        except Exception as e:
+            logger.warning(f"Slash command sync failed: {e}")
         await self._setup_channels()
+
+    # ─── Slash Commands ───────────────────────────────────────────────────────
+
+    def _register_slash_commands(self):
+        """Register all app_commands (slash commands) on the bot's tree."""
+
+        @self.tree.command(name="status", description="Live bot status summary")
+        async def slash_status(interaction: discord.Interaction):
+            from discord_bot.panel import build_main_panel
+            embed = build_main_panel(self.state)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @self.tree.command(name="portfolio", description="Portfolio exposure and P/L")
+        async def slash_portfolio(interaction: discord.Interaction):
+            from discord_bot.panel import build_portfolio_embed
+            embed = build_portfolio_embed(self.state)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @self.tree.command(name="audit", description="Entry block diagnostics")
+        async def slash_audit(interaction: discord.Interaction):
+            from discord_bot.panel import build_audit_panel
+            embed = build_audit_panel(self.state)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @self.tree.command(name="pause", description="Pause the trading engine")
+        async def slash_pause(interaction: discord.Interaction):
+            from config import DISCORD_OWNER_ID
+            if interaction.user.id != DISCORD_OWNER_ID:
+                await interaction.response.send_message("⛔ Unauthorized.", ephemeral=True)
+                return
+            self.state.is_paused = True
+            await interaction.response.send_message("⏸ Bot **PAUSED**.", ephemeral=False)
+
+        @self.tree.command(name="resume", description="Resume the trading engine")
+        async def slash_resume(interaction: discord.Interaction):
+            from config import DISCORD_OWNER_ID
+            if interaction.user.id != DISCORD_OWNER_ID:
+                await interaction.response.send_message("⛔ Unauthorized.", ephemeral=True)
+                return
+            self.state.is_paused = False
+            await interaction.response.send_message("▶ Bot **RESUMED**.", ephemeral=False)
+
+    # ─── Alert Queue Consumer ─────────────────────────────────────────────────
+
+    @tasks.loop(seconds=0.5)
+    async def consume_alerts(self):
+        """Drain the alert_router queue and send embeds to SIGNALS channel."""
+        ch = self._ch.get("SIGNALS")
+        if ch is None:
+            return
+
+        while not alert_router.queue.empty():
+            try:
+                payload = alert_router.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            try:
+                await self._dispatch_payload(ch, payload)
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry = float(getattr(e, "retry_after", 5))
+                    logger.warning(f"[SIGNALS] rate limited — sleeping {retry:.1f}s")
+                    await asyncio.sleep(retry)
+                    # Re-queue so it's not lost
+                    alert_router.queue.put_nowait(payload)
+                    break
+                else:
+                    logger.error(f"[SIGNALS] HTTP {e.status}: {e}")
+            except Exception as e:
+                logger.error(f"[SIGNALS] dispatch error: {e}")
+            finally:
+                alert_router.queue.task_done()
+
+    @consume_alerts.before_loop
+    async def before_consume(self):
+        await self.wait_until_ready()
+
+    async def _dispatch_payload(self, ch: discord.TextChannel, payload: dict):
+        """Route a queue payload to the correct embed builder and send it."""
+        ptype = payload.get("type")
+
+        if ptype == "TRADE":
+            embed = build_trade_notification(
+                payload["action"],
+                payload["pair"],
+                payload["pair_state"],
+                payload["bot_state"],
+                payload["pl"],
+            )
+            await ch.send(embed=embed)
+
+        elif ptype == "FUTURES":
+            embed = self._build_futures_embed(payload)
+            is_entry = "ENTRY" in payload["action"]
+            view = (
+                FuturesKillSwitchView(payload["symbol"], payload["side"])
+                if is_entry else None
+            )
+            if view:
+                await ch.send(embed=embed, view=view)
+            else:
+                await ch.send(embed=embed)
+
+        elif ptype == "SYSTEM":
+            level = payload.get("level", "warning")
+            color = {
+                "info":    0x3498db,
+                "warning": 0xFFD700,
+                "error":   0xFF0000,
+            }.get(level, 0xFFD700)
+            embed = discord.Embed(
+                title="⚙️ System Alert",
+                description=payload["message"],
+                color=color,
+            )
+            await ch.send(embed=embed)
+
+    @staticmethod
+    def _build_futures_embed(p: dict) -> discord.Embed:
+        """Institutional-style embed for futures entries and exits."""
+        is_long   = p["side"] == "long"
+        is_entry  = "ENTRY" in p["action"]
+        pl        = p.get("pl", 0.0)
+
+        if is_entry:
+            color = 0x2ecc71 if is_long else 0xe74c3c
+        else:
+            color = 0x2ecc71 if pl >= 0 else 0xe74c3c
+
+        direction_icon = "📈" if is_long else "📉"
+        action_label   = p["action"].replace("_", " ")
+
+        embed = discord.Embed(
+            title=f"⚡ {action_label}  ·  {p['symbol']}",
+            color=color,
+        )
+        embed.add_field(name="Direction",    value=f"{direction_icon} **{p['side'].upper()}**", inline=True)
+        embed.add_field(name="Entry Price",  value=f"`${p['entry_price']:,.4f}`",               inline=True)
+        embed.add_field(name="Size (USDT)",  value=f"`${p['size']:.2f}`",                       inline=True)
+
+        if p.get("sl_price"):
+            embed.add_field(name="Stop Loss",  value=f"`${p['sl_price']:,.4f}`", inline=True)
+        if p.get("tp_price"):
+            embed.add_field(name="Take Profit",value=f"`${p['tp_price']:,.4f}`", inline=True)
+
+        if not is_entry and pl != 0.0:
+            sign = "+" if pl >= 0 else ""
+            embed.add_field(
+                name="Realized PnL",
+                value=f"**{sign}${pl:.4f}**",
+                inline=False,
+            )
+
+        embed.set_footer(text="USDⓈ-M Futures  ·  5× Isolated  ·  reduceOnly exits")
+        return embed
 
     async def _setup_channels(self):
         """Fetch all 5 channels by ID, rename them to terminal scheme, post panels."""
@@ -347,31 +514,16 @@ class TradingDiscordBot(discord.Client):
         await self.wait_until_ready()
 
 
-async def send_trade_notification(action: str, pair: str, pair_state, bot_state, pl: float = 0.0):
-    """Send a trade notification embed to the SIGNALS channel.
+def send_trade_notification(action: str, pair: str, pair_state, bot_state, pl: float = 0.0):
+    """Drop a trade alert onto the queue — non-blocking, returns immediately.
 
-    The SIGNALS channel is the read-only entry/exit ledger.  Trade notifications
-    land here instead of the MAIN panel so MAIN stays clean (positions only).
-    Throttled to _NOTIFICATION_MIN_GAP_SECS between sends to prevent burst-sends
-    during rapid multi-pair activity from triggering per-channel 429 rate limits.
+    The queue consumer in TradingDiscordBot.consume_alerts() picks this up
+    and handles the actual Discord API send with rate-limit backoff.
+
+    Signature kept synchronous so bot.py callers don't need to await it
+    (they already fire-and-forget via discord_notify_callback).
     """
-    if _signal_channel is None:
-        return
-
-    now = time.monotonic()
-    if _discord_client is not None:
-        last_ts = getattr(_discord_client, "_last_notification_ts", 0.0)
-        elapsed = now - last_ts
-        if elapsed < _NOTIFICATION_MIN_GAP_SECS:
-            await asyncio.sleep(_NOTIFICATION_MIN_GAP_SECS - elapsed)
-        if _discord_client is not None:
-            _discord_client._last_notification_ts = time.monotonic()
-
-    try:
-        embed = build_trade_notification(action, pair, pair_state, bot_state, pl)
-        await _signal_channel.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Failed to send trade notification: {e}")
+    alert_router.dispatch_trade_alert(action, pair, pair_state, bot_state, pl)
 
 
 async def start_discord_bot(state):

@@ -1197,7 +1197,7 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
     )
 
     if discord_notify_callback:
-        await discord_notify_callback("BUY", pair, ps, state)
+        discord_notify_callback("BUY", pair, ps, state)
 
     update_portfolio_tracking(state)
     await asyncio.get_running_loop().run_in_executor(None, save_state_to_db, state)
@@ -1329,7 +1329,7 @@ async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None =
     )
 
     if discord_notify_callback:
-        await discord_notify_callback(action_label, pair, ps, state, pl)
+        discord_notify_callback(action_label, pair, ps, state, pl)
 
     update_portfolio_tracking(state)
     await asyncio.get_running_loop().run_in_executor(None, save_state_to_db, state)
