@@ -331,6 +331,7 @@ def save_state_to_db(state: BotState):
     """Persist current BotState to trades.db for restart recovery."""
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
         _ensure_state_table(conn)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -359,6 +360,7 @@ def load_state_from_db() -> BotState | None:
     """Load last known BotState from trades.db. Returns None if no saved state."""
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
         _ensure_state_table(conn)
 
         row = conn.execute(

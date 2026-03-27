@@ -22,6 +22,7 @@ DB_PATH = "trades.db"
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")   # crash-safe writes; concurrent readers don't block
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -19,13 +19,18 @@ RSI_SELL_THRESHOLD = 70         # RSI above this = overbought = sell signal
 VOLUME_SPIKE_MULTIPLIER = 1.5   # Volume 1.5x the average = spike
 CONFIDENCE_BUY_THRESHOLD = 2.0  # Min weighted score to trigger a buy (lowered from 2.7 — recalibrated now that
                                  # structure_score and volatility_score are computed from candle data, max effective ~3.0)
-STOP_LOSS_PCT = 0.5             # Hard stop-loss: tightened from 0.6 — smaller losers, better R/R
+STOP_LOSS_PCT = 0.5             # Hard stop-loss floor — minimum SL regardless of ATR
 PROFIT_TARGET_PCT = 1.2         # Fallback TP when ATR exits are off
 
 # ─── ATR-Based Exits (replaces fixed TP for adaptive exits) ─────────────
 ATR_PERIOD = 14                 # ATR lookback in candles (14 × 15m = 3.5 hours)
 ATR_TRAILING_MULTIPLIER = 1.5   # Tighter ATR trail for scalp-sized risk
 ATR_TP_MULTIPLIER = 2.0         # Reward still > risk, but reachable intraday
+# Dynamic stop-loss: SL widens with ATR to prevent whipsaw in volatile markets.
+# effective_sl = max(STOP_LOSS_PCT, atr_pct_as_percent * ATR_SL_MULTIPLIER)
+# e.g. ATR=0.4%, multiplier=1.5 → SL=0.6%; ATR=0.8% → SL=1.2%. Floor is always STOP_LOSS_PCT.
+ATR_SL_MULTIPLIER = 1.5         # ATR multiple for dynamic stop-loss (Triple Barrier lower barrier)
+ATR_SL_MAX_PCT = 2.0            # Hard cap on dynamic SL — never widen beyond 2% of entry
 ATR_MAX_TRAIL_PCT = 0.02        # Max trail distance once in profit (2% of price)
 ATR_TRAIL_ACTIVATION_PCT = 0.25 # Trail activates after meaningful move — avoids noise stop-outs on small bounces
 USE_ATR_EXITS = True            # True = ATR-based exits, False = fixed % exits

@@ -34,7 +34,7 @@ from config import (
     TRADE_SIZE_PCT, MAX_POSITION_PCT, PROFIT_TARGET_PCT,
     ETHERSCAN_COINS,
     USE_ATR_EXITS, ATR_TRAILING_MULTIPLIER, ATR_TP_MULTIPLIER,
-    ATR_MAX_TRAIL_PCT, ATR_TRAIL_ACTIVATION_PCT,
+    ATR_MAX_TRAIL_PCT, ATR_TRAIL_ACTIVATION_PCT, ATR_SL_MULTIPLIER, ATR_SL_MAX_PCT,
     DRAWDOWN_TRIGGER_PCT, TRADE_COOLDOWN_SECONDS, TRADE_COOLDOWN_TRENDING,
     COOLDOWN_BYPASS_CONFIDENCE, COOLDOWN_BYPASS_REGIMES,
     FAILED_EXIT_COOLDOWN_STAGNATION, FAILED_EXIT_COOLDOWN_TRAIL_STOP, FAILED_EXIT_COOLDOWN_HARD_STOP,
@@ -552,7 +552,12 @@ def _position_metrics(ps) -> dict:
 
     hard_stop_price = 0.0
     if ps.buy_price > 0:
-        hard_stop_price = ps.buy_price * (1 - STOP_LOSS_PCT / 100)
+        # Dynamic (Triple Barrier) stop-loss: widen with ATR in volatile markets
+        # to prevent whipsaw stop-outs; floor is always STOP_LOSS_PCT.
+        # e.g. ATR=0.4% → SL=0.6%; ATR=0.8% → SL=1.2%; quiet ATR=0.2% → floor 0.5%
+        atr_sl_pct = ps.atr_pct * ATR_SL_MULTIPLIER * 100 if ps.atr_pct > 0 else 0.0
+        effective_sl_pct = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, atr_sl_pct))
+        hard_stop_price = ps.buy_price * (1 - effective_sl_pct / 100)
 
     active_stop = hard_stop_price
     if ps.trailing_stop > 0:

@@ -361,6 +361,7 @@ def _get_24h_stats() -> tuple[int, float]:
     placeholders = ",".join("?" for _ in sell_actions)
     try:
         conn = sqlite3.connect("trades.db")
+        conn.execute("PRAGMA journal_mode=WAL")
         sells = conn.execute(
             f"SELECT COUNT(*) FROM trades WHERE action IN ({placeholders}) AND timestamp >= ?",
             (*sell_actions, cutoff),
