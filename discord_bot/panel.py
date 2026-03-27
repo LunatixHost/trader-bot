@@ -1165,6 +1165,312 @@ def build_exit_analytics_embed() -> discord.Embed:
     return embed
 
 
+# ─── Multi-channel panel builders ────────────────────────────────────────────
+
+
+def build_audit_panel(state) -> discord.Embed:
+    """AUDIT channel — per-pair entry diagnostic (why the bot isn't trading).
+
+    Keeps diagnostic noise completely out of the MAIN terminal so the owner
+    can open #terminal-audit when the bot is silent and see exactly which gate
+    is blocking each pair, without reading through positions or equity data.
+    """
+    now_unix = int(datetime.now(timezone.utc).timestamp())
+    embed = discord.Embed(
+        title="🔍 ENTRY AUDIT — Block Reasons",
+        description=f"Updated <t:{now_unix}:t>  ·  Why entries are not firing",
+        color=COLOR_BLUE,
+    )
+
+    all_ps = list(state.pairs.values())
+
+    # ── Spot scalp entry blocks ───────────────────────────────────────────────
+    spot_lines = []
+    for ps in sorted(all_ps, key=lambda p: p.base_asset):
+        block  = _entry_block_reason(ps, state)
+        eff    = _effective_score(ps)
+        thr    = _effective_threshold(ps)
+        trend  = getattr(ps, "trend", "?")
+        regime = str(getattr(ps, "regime", "?")).replace("_", " ")
+
+        if block is None and getattr(ps, "decision", "HOLD") == "BUY":
+            status = "READY ✓"
+        elif block:
+            _SPOT_BLOCK_LABELS = {
+                "add_blocked":            "avg-down blocked",
+                "cooldown":               _cooldown_label(ps),
+                "failed_exit_cooldown":   _failed_exit_cooldown_label(ps),
+                "spike_filter":           "price spike",
+                "unstable_candle":        "volatile candle",
+                "uneconomic_move":        "ATR < fee cost",
+                "spread_filter":          "wide spread",
+                "insufficient_spendable": "no capital",
+                "position_maxed":         "position maxed",
+                "min_notional":           "order too small",
+                "fvg_cooldown":           "FVG cooldown",
+            }
+            status = _SPOT_BLOCK_LABELS.get(block, block)
+        else:
+            gap = thr - eff
+            status = f"need +{gap:.1f} score"
+
+        spot_lines.append(
+            f"{ps.base_asset:<6} {trend:<10} {regime:<18}  "
+            f"Eff:{eff:.1f}/{thr:.1f}  {status}"
+        )
+
+    embed.add_field(
+        name="⚡ SPOT SCALP BLOCKS",
+        value="```\n" + "\n".join(spot_lines) + "\n```",
+        inline=False,
+    )
+
+    # ── Futures entry blocks ──────────────────────────────────────────────────
+    if FUTURES_PAPER_ENABLED:
+        try:
+            from futures_paper import (
+                get_futures_entry_block_reason,
+                _futures_bearish_score,
+                _futures_bullish_score,
+            )
+            futures_lines = []
+            for pair, fp_s in sorted(getattr(state, "futures_states", {}).items()):
+                base = pair.replace("USDT", "")
+                if fp_s.is_open:
+                    pnl_rough = "open"
+                    futures_lines.append(f"  {base:<6} ▶ POSITION OPEN ({fp_s.side.upper()})")
+                    continue
+                ps = state.pairs.get(pair)
+                if ps is None:
+                    futures_lines.append(f"  {base:<6} ⚪ no pair state")
+                    continue
+                try:
+                    s_score = _futures_bearish_score(ps)
+                    s_block = get_futures_entry_block_reason(ps, fp_s, "short", s_score)
+                    l_score = _futures_bullish_score(ps)
+                    l_block = get_futures_entry_block_reason(ps, fp_s, "long",  l_score)
+
+                    if not s_block:
+                        futures_lines.append(
+                            f"  {base:<6} 🔴 SHORT READY ✓  score={s_score:.1f}"
+                        )
+                    elif not l_block:
+                        futures_lines.append(
+                            f"  {base:<6} 🟢 LONG READY ✓   score={l_score:.1f}"
+                        )
+                    else:
+                        s_lbl = _futures_block_label(s_block)
+                        l_lbl = _futures_block_label(l_block)
+                        futures_lines.append(
+                            f"  {base:<6} ⚪ S:{s_lbl:<24} L:{l_lbl}"
+                        )
+                except Exception:
+                    futures_lines.append(f"  {base:<6} ⚪ —")
+
+            if futures_lines:
+                embed.add_field(
+                    name="📉 FUTURES PAPER BLOCKS",
+                    value="```\n" + "\n".join(futures_lines) + "\n```",
+                    inline=False,
+                )
+        except Exception:
+            pass
+
+    return embed
+
+
+def build_equity_panel(state) -> discord.Embed:
+    """EQUITY channel — PnL accounting, funding costs, win-rate breakdown.
+
+    Completely separated from positions / diagnostics so the owner has a
+    single channel that answers "how much money did I make / lose today?".
+    """
+    now_unix = int(datetime.now(timezone.utc).timestamp())
+
+    from logger import get_trade_stats
+    stats       = get_trade_stats()
+    trades_24h, win_rate_24h = _get_24h_stats()
+
+    pl_pct  = getattr(state, "portfolio_pl_pct",  0.0) or 0.0
+    pl_usdt = getattr(state, "portfolio_pl_usdt", 0.0) or 0.0
+    color   = COLOR_GREEN if pl_pct >= 0 else (COLOR_ORANGE if pl_pct > -2.0 else COLOR_RED)
+
+    embed = discord.Embed(
+        title="💰 EQUITY — PnL Accounting",
+        description=f"Updated <t:{now_unix}:t>  ·  Net P/L this session: {'+' if pl_usdt >= 0 else ''}${pl_usdt:.2f}",
+        color=color,
+    )
+
+    # ── Spot scalp accounting ─────────────────────────────────────────────────
+    spot_lines = [
+        f"Portfolio    ${getattr(state, 'portfolio_current_value', 0.0):,.2f}",
+        f"Start Value  ${getattr(state, 'portfolio_start_value',   0.0):,.2f}",
+        f"Session P/L  {_pl_display(pl_usdt, pl_pct)}",
+        "",
+        f"Trades 24h   {trades_24h}   Win {win_rate_24h:.0f}%",
+        f"All Closed   {stats['sells']}   Wins {stats['profitable']}",
+        f"Total Gain   +${stats['total_gain']:,.2f}",
+        f"Total Loss    ${stats['total_loss']:,.2f}",
+    ]
+    embed.add_field(
+        name="⚡ SPOT SCALP",
+        value="```\n" + "\n".join(spot_lines) + "\n```",
+        inline=False,
+    )
+
+    # ── Futures paper accounting ──────────────────────────────────────────────
+    if FUTURES_PAPER_ENABLED:
+        realized     = getattr(state, "futures_paper_realized_pnl",    0.0) or 0.0
+        total_ftrades = getattr(state, "futures_paper_total_trades",   0)   or 0
+        wins_ftrades  = getattr(state, "futures_paper_winning_trades", 0)   or 0
+        win_rate_f    = (wins_ftrades / total_ftrades * 100) if total_ftrades > 0 else 0.0
+
+        try:
+            from futures_paper import get_futures_open_positions, get_futures_unrealized_pnl
+            unrealized = get_futures_unrealized_pnl(state)
+            positions  = get_futures_open_positions(state)
+        except Exception:
+            unrealized = 0.0
+            positions  = []
+
+        total_f_pnl = realized + unrealized
+        r_sign = "+" if realized    >= 0 else ""
+        u_sign = "+" if unrealized  >= 0 else ""
+        t_sign = "+" if total_f_pnl >= 0 else ""
+
+        f_lines = [
+            f"Total P/L    {t_sign}${total_f_pnl:.2f}",
+            f"  Realized   {r_sign}${realized:.2f}",
+            f"  Unrealized {u_sign}${unrealized:.2f}",
+            f"Trades       {total_ftrades}   Win Rate {win_rate_f:.0f}%",
+        ]
+
+        # Per-position funding breakdown
+        if positions:
+            f_lines.append("")
+            f_lines.append("Open positions:")
+            for pos in positions:
+                funding  = pos.get("accrued_funding_usdt", 0.0)
+                pnl_pct  = pos["pnl_pct"]
+                icon     = "🟢" if pnl_pct >= 0 else "🔴"
+                fund_str = f"-${funding:.4f}" if funding > 0 else "none"
+                net_usdt = pos["pl_usdt"] - funding
+                f_lines.append(
+                    f"  {pos['base']:<6} {pos['side'].upper()} {icon} "
+                    f"{pnl_pct:+.2f}%  net ${net_usdt:+.2f}  "
+                    f"funding {fund_str}  held {int(pos['held_min'])}m"
+                )
+
+        embed.add_field(
+            name="📉 FUTURES PAPER",
+            value="```\n" + "\n".join(f_lines) + "\n```",
+            inline=False,
+        )
+
+    # ── Long-term P/L ────────────────────────────────────────────────────────
+    if LONG_TERM_ENABLED:
+        lt_lines = []
+        for pair in LONG_TERM_ASSETS:
+            lt_s = getattr(state, "long_term_states", {}).get(pair)
+            ps   = state.pairs.get(pair)
+            base = pair.replace("USDT", "")
+            if lt_s and lt_s.holding and lt_s.quantity > 0 and ps:
+                cur     = float(getattr(ps, "current_price", 0.0))
+                cost    = lt_s.quantity * lt_s.entry_price
+                value   = lt_s.quantity * cur if cur > 0 else 0.0
+                lt_pl   = value - cost
+                lt_pct  = (lt_pl / cost * 100) if cost > 0 else 0.0
+                sign    = "+" if lt_pl >= 0 else ""
+                held    = _held_str(lt_s.entry_time)
+                lt_lines.append(
+                    f"  {base:<6} HOLD  {sign}{lt_pct:.2f}%  ({sign}${lt_pl:.2f})"
+                    f"  held {held}"
+                )
+            else:
+                lt_lines.append(f"  {base:<6} WATCHING")
+
+        if lt_lines:
+            embed.add_field(
+                name="📦 LONG-TERM POSITIONS",
+                value="```\n" + "\n".join(lt_lines) + "\n```",
+                inline=False,
+            )
+
+    return embed
+
+
+def build_admin_panel(state) -> discord.Embed:
+    """ADMIN channel — system health and master override controls.
+
+    Intentionally light — no positions, no block reasons.
+    Shows uptime, mode, risk state, and session summary so the admin can
+    confirm the bot is alive and healthy without digging into MAIN.
+    """
+    now_unix   = int(datetime.now(timezone.utc).timestamp())
+    mode       = "TESTNET" if USE_TESTNET else "LIVE"
+    mode_badge = "🧪" if USE_TESTNET else "🔴"
+    uptime     = _uptime(state.bot_uptime_start)
+    status     = _bot_status_label(state)
+
+    color = (
+        COLOR_GRAY   if state.is_paused else
+        COLOR_RED    if getattr(state, "btc_crash_active", False) else
+        COLOR_ORANGE if getattr(state, "in_drawdown", False) else
+        COLOR_BLUE
+    )
+
+    embed = discord.Embed(
+        title=f"⚙️ ADMIN — System Health  ·  {status}",
+        description=(
+            f"{mode_badge} {mode}  ·  Updated <t:{now_unix}:t>  ·  Uptime {uptime}"
+        ),
+        color=color,
+    )
+
+    btc_chg  = getattr(state, "btc_15m_change_pct", 0.0) or 0.0
+    risk_mode = "DEFENSIVE ⚠️" if state.in_drawdown else "NORMAL"
+    crash_str = "ACTIVE 🔴" if getattr(state, "btc_crash_active", False) else "Clear ✓"
+
+    sys_lines = [
+        f"Status     {status}",
+        f"Mode       {mode}",
+        f"Risk Mode  {risk_mode}",
+        f"BTC Crash  {crash_str}",
+        f"BTC 15m    {btc_chg:+.2f}%",
+        f"Paused     {'YES ⏸' if state.is_paused else 'No'}",
+        f"Drawdown   {getattr(state, 'drawdown_pct', 0.0):.2f}%",
+        f"Open Pos   {getattr(state, 'open_positions_count', 0)}",
+        f"USDT Cash  ${getattr(state, 'usdt_balance', 0.0):,.2f}",
+    ]
+    embed.add_field(
+        name="🔧 SYSTEM STATUS",
+        value="```\n" + "\n".join(sys_lines) + "\n```",
+        inline=False,
+    )
+
+    from logger import get_trade_stats
+    stats       = get_trade_stats()
+    trades_24h, win_rate_24h = _get_24h_stats()
+
+    pl_pct  = getattr(state, "portfolio_pl_pct",  0.0) or 0.0
+    pl_usdt = getattr(state, "portfolio_pl_usdt", 0.0) or 0.0
+
+    perf_lines = [
+        f"Portfolio  ${getattr(state, 'portfolio_current_value', 0.0):,.2f}",
+        f"P/L        {_pl_display(pl_usdt, pl_pct)}",
+        f"24h Trades {trades_24h}  |  Win {win_rate_24h:.0f}%",
+        f"All-Time   {stats['sells']} closed  |  "
+        f"{stats['profitable']}W / {stats['sells'] - stats['profitable']}L",
+    ]
+    embed.add_field(
+        name="📊 SESSION SUMMARY",
+        value="```\n" + "\n".join(perf_lines) + "\n```",
+        inline=False,
+    )
+
+    return embed
+
+
 # Exit action → color mapping for trade notifications
 _NOTIFICATION_COLORS = {
     "BUY":          COLOR_GREEN,

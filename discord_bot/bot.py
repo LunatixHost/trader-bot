@@ -11,10 +11,13 @@ import time
 import discord
 from discord.ext import tasks
 from config import (
-    DISCORD_BOT_TOKEN, DISCORD_PANEL_CHANNEL_NAME,
+    DISCORD_BOT_TOKEN, DISCORD_CHANNELS,
     INTERVAL_DISCORD_PANEL,
 )
-from discord_bot.panel import build_main_panel, build_trade_notification
+from discord_bot.panel import (
+    build_main_panel, build_audit_panel, build_equity_panel,
+    build_admin_panel, build_trade_notification,
+)
 from discord_bot.views import MainView
 from discord_bot.chart import generate_chart
 from logger import get_trades_for_pair
@@ -86,13 +89,31 @@ logger = logging.getLogger("trading_bot.discord")
 
 # Module-level references set during startup
 _state = None
-_panel_message: discord.Message | None = None
-_panel_channel: discord.TextChannel | None = None
 _discord_client: discord.Client | None = None
+# SIGNALS channel reference — set during setup; used by send_trade_notification
+_signal_channel: discord.TextChannel | None = None
+
+
+# Map each live-panel key to its builder function and whether it gets buttons.
+# SIGNALS has no live panel — it is notification-only.
+_PANEL_BUILDERS = {
+    "MAIN":   (build_main_panel,   True),   # True  = attach MainView buttons
+    "AUDIT":  (build_audit_panel,  False),  # False = read-only, no buttons
+    "EQUITY": (build_equity_panel, False),
+    "ADMIN":  (build_admin_panel,  False),  # admin status; buttons via MAIN
+}
 
 
 class TradingDiscordBot(discord.Client):
-    """Discord client for the trading bot panel."""
+    """Discord client — multi-channel terminal architecture.
+
+    Channels:
+      MAIN    — active positions + full button controls
+      SIGNALS — trade entry/exit notification ledger (no live panel)
+      AUDIT   — entry block diagnostic (read-only live panel)
+      EQUITY  — PnL accounting (read-only live panel)
+      ADMIN   — system health (read-only live panel)
+    """
 
     def __init__(self, state):
         intents = discord.Intents.default()
@@ -100,64 +121,81 @@ class TradingDiscordBot(discord.Client):
         intents.guilds = True
         super().__init__(intents=intents)
         self.state = state
-        self.panel_message: discord.Message | None = None
-        self.panel_channel: discord.TextChannel | None = None
-        self._last_fingerprint: str = ""
-        self._last_refresh_ts: float = 0.0
-        self._rate_limit_until: float = 0.0   # monotonic timestamp; skip edits before this
-        self._last_notification_ts: float = 0.0  # throttle trade notification channel.send
+
+        # Per-channel Discord objects (populated in _setup_channels)
+        self._ch:  dict[str, discord.TextChannel | None] = {
+            k: None for k in ("MAIN", "SIGNALS", "AUDIT", "EQUITY", "ADMIN")
+        }
+        self._msg: dict[str, discord.Message | None] = {
+            k: None for k in ("MAIN", "AUDIT", "EQUITY", "ADMIN")
+        }
+
+        # Refresh state tracking
+        self._last_fingerprint:    str   = ""
+        self._last_refresh_ts:     float = 0.0
+        self._rate_limit_until:    float = 0.0
+        self._last_notification_ts: float = 0.0
 
     async def setup_hook(self):
-        """Called when the bot is ready to set up background tasks."""
-        self.refresh_panel.start()
+        self.refresh_panels.start()
 
     async def on_ready(self):
         logger.info(f"Discord bot logged in as {self.user}")
-        await self._setup_panel()
+        await self._setup_channels()
 
-    async def _setup_panel(self):
-        """Find or create the trading-bot channel, clear old messages, post panel."""
-        global _panel_message, _panel_channel
+    async def _setup_channels(self):
+        """Fetch all 5 channels by ID, post initial live panels in MAIN/AUDIT/EQUITY/ADMIN."""
+        global _signal_channel
 
-        for guild in self.guilds:
-            # Find existing channel
-            channel = discord.utils.get(
-                guild.text_channels, name=DISCORD_PANEL_CHANNEL_NAME
-            )
-
-            # Create if not found
-            if channel is None:
-                try:
-                    channel = await guild.create_text_channel(DISCORD_PANEL_CHANNEL_NAME)
-                    logger.info(f"Created #{DISCORD_PANEL_CHANNEL_NAME} in {guild.name}")
-                except discord.Forbidden:
-                    logger.error(f"No permission to create channel in {guild.name}")
-                    continue
-
-            self.panel_channel = channel
-            _panel_channel = channel
-
-            # Clear old messages
+        logger.info("Setting up multi-channel terminal…")
+        for key, ch_id in DISCORD_CHANNELS.items():
             try:
-                await channel.purge(limit=50)
+                ch = await self.fetch_channel(ch_id)
+                self._ch[key] = ch
+                logger.info(f"  [{key}] bound → #{ch.name} (id={ch_id})")
             except discord.Forbidden:
-                logger.warning("No permission to purge messages")
+                logger.error(f"  [{key}] no access to channel {ch_id}")
+            except discord.NotFound:
+                logger.error(f"  [{key}] channel {ch_id} not found")
+            except Exception as e:
+                logger.error(f"  [{key}] fetch error: {e}")
 
-            # Post the main panel
-            embed = build_main_panel(self.state)
-            view = MainView(self.state, chart_callback=self._chart_callback, execute_sell_callback=self._execute_sell_callback)
-            msg = await channel.send(embed=embed, view=view)
-            self.panel_message = msg
-            _panel_message = msg
+        # Wire up the SIGNALS channel for trade notifications
+        _signal_channel = self._ch.get("SIGNALS")
 
-            # Pin it
+        # Post initial live panels
+        for key, (builder, has_buttons) in _PANEL_BUILDERS.items():
+            ch = self._ch.get(key)
+            if ch is None:
+                logger.warning(f"  [{key}] skipped (channel not available)")
+                continue
+
+            # Purge stale messages
             try:
-                await msg.pin()
+                await ch.purge(limit=50)
             except discord.Forbidden:
                 pass
 
-            logger.info(f"Panel posted in #{DISCORD_PANEL_CHANNEL_NAME}")
-            break  # Only use first guild
+            # Build embed + optional view
+            try:
+                embed = builder(self.state)
+                view  = (
+                    MainView(
+                        self.state,
+                        chart_callback=self._chart_callback,
+                        execute_sell_callback=self._execute_sell_callback,
+                    )
+                    if has_buttons else None
+                )
+                msg = await ch.send(embed=embed, **({"view": view} if view else {}))
+                self._msg[key] = msg
+                try:
+                    await msg.pin()
+                except discord.Forbidden:
+                    pass
+                logger.info(f"  [{key}] panel posted in #{ch.name}")
+            except Exception as e:
+                logger.error(f"  [{key}] failed to post initial panel: {e}")
 
     async def _execute_sell_callback(self, pair: str, note: str = "FORCE SELL"):
         """Force-sell a position from Discord (called by AbandonConfirmView)."""
@@ -190,73 +228,112 @@ class TradingDiscordBot(discord.Client):
                 f"Chart error for {base}/USDT: {e}",
             )
 
-    @tasks.loop(seconds=INTERVAL_DISCORD_PANEL)
-    async def refresh_panel(self):
-        """Refresh the panel embed when state changes or every 30 seconds.
-
-        Checks state fingerprint every INTERVAL_DISCORD_PANEL seconds.
-        Only calls message.edit() when something visible has actually changed,
-        or when _PANEL_FORCE_REFRESH_SECS have elapsed (to keep the timestamp
-        in the header current). This lets the interval stay low without burning
-        Discord's rate limit on duplicate edits.
-        """
-        if self.panel_message is None:
+    async def _repost_panel(self, key: str, builder, has_buttons: bool):
+        """Re-post a panel message after NotFound (message deleted)."""
+        ch = self._ch.get(key)
+        if ch is None:
             return
+        try:
+            embed = builder(self.state)
+            view  = (
+                MainView(
+                    self.state,
+                    chart_callback=self._chart_callback,
+                    execute_sell_callback=self._execute_sell_callback,
+                )
+                if has_buttons else None
+            )
+            msg = await ch.send(embed=embed, **({"view": view} if view else {}))
+            self._msg[key] = msg
+            try:
+                await msg.pin()
+            except discord.Forbidden:
+                pass
+            logger.info(f"[{key}] panel re-posted after NotFound")
+        except Exception as e:
+            logger.error(f"[{key}] failed to re-post panel: {e}")
 
+    @tasks.loop(seconds=INTERVAL_DISCORD_PANEL)
+    async def refresh_panels(self):
+        """Refresh all four live panel embeds when state changes.
+
+        Uses a shared fingerprint: when anything meaningful changes (position
+        opened/closed, regime shift, score bucket change, etc.) all four panels
+        update together.  On quiet cycles only the force-refresh interval
+        triggers an edit, keeping the "Updated <t:>" timestamps current.
+
+        Rate-limit strategy: if a 429 is received on any channel we back off
+        the entire refresh cycle (break out of the loop) so we don't cascade
+        rate limits across the remaining channels.
+        """
         now = time.monotonic()
 
-        # Honour any active rate-limit backoff before doing anything else
         if now < self._rate_limit_until:
             return
 
-        fingerprint = _panel_fingerprint(self.state)
+        fingerprint   = _panel_fingerprint(self.state)
         state_changed = fingerprint != self._last_fingerprint
-        force_due = (now - self._last_refresh_ts) >= _PANEL_FORCE_REFRESH_SECS
+        force_due     = (now - self._last_refresh_ts) >= _PANEL_FORCE_REFRESH_SECS
 
         if not state_changed and not force_due:
-            return  # Nothing worth updating yet
+            return
 
-        try:
-            embed = build_main_panel(self.state)
-            view = MainView(self.state, chart_callback=self._chart_callback, execute_sell_callback=self._execute_sell_callback)
-            await self.panel_message.edit(embed=embed, view=view)
-            self._last_fingerprint = fingerprint
-            self._last_refresh_ts = now
-        except discord.NotFound:
-            # Message was deleted — repost
-            logger.warning("Panel message not found, reposting...")
-            await self._setup_panel()
-        except discord.HTTPException as e:
-            if e.status == 429:
-                # Use the retry_after Discord sends us; fall back to 60 s if absent
-                retry_after = float(getattr(e, "retry_after", 60))
-                self._rate_limit_until = now + retry_after
-                logger.warning(
-                    f"Panel rate limited — backing off {retry_after:.1f}s "
-                    f"(resumes in ~{retry_after:.0f}s)"
-                )
-            elif e.status in (500, 502, 503, 504):
-                # Discord-side transient error — back off 30 s and retry silently
-                self._rate_limit_until = now + 30.0
-                logger.warning(f"Panel refresh skipped: Discord {e.status} (backing off 30s)")
-            else:
-                logger.error(f"Panel refresh HTTP error: {e}")
-        except Exception as e:
-            logger.error(f"Panel refresh error: {e}")
+        for key, (builder, has_buttons) in _PANEL_BUILDERS.items():
+            msg = self._msg.get(key)
+            if msg is None:
+                continue
 
-    @refresh_panel.before_loop
+            try:
+                embed = builder(self.state)
+                if has_buttons:
+                    view = MainView(
+                        self.state,
+                        chart_callback=self._chart_callback,
+                        execute_sell_callback=self._execute_sell_callback,
+                    )
+                    await msg.edit(embed=embed, view=view)
+                else:
+                    await msg.edit(embed=embed)
+
+            except discord.NotFound:
+                logger.warning(f"[{key}] panel message not found — reposting")
+                await self._repost_panel(key, builder, has_buttons)
+
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = float(getattr(e, "retry_after", 60))
+                    self._rate_limit_until = now + retry_after
+                    logger.warning(
+                        f"[{key}] rate limited — backing off {retry_after:.1f}s"
+                    )
+                    break  # abort remaining channels this cycle
+                elif e.status in (500, 502, 503, 504):
+                    self._rate_limit_until = now + 30.0
+                    logger.warning(f"[{key}] Discord {e.status} — backing off 30s")
+                    break
+                else:
+                    logger.error(f"[{key}] panel HTTP error {e.status}: {e}")
+
+            except Exception as e:
+                logger.error(f"[{key}] panel refresh error: {e}")
+
+        self._last_fingerprint = fingerprint
+        self._last_refresh_ts  = now
+
+    @refresh_panels.before_loop
     async def before_refresh(self):
         await self.wait_until_ready()
 
 
 async def send_trade_notification(action: str, pair: str, pair_state, bot_state, pl: float = 0.0):
-    """Send a trade notification to the trading-bot channel.
+    """Send a trade notification embed to the SIGNALS channel.
 
-    Called from bot.py after each trade execution.
+    The SIGNALS channel is the read-only entry/exit ledger.  Trade notifications
+    land here instead of the MAIN panel so MAIN stays clean (positions only).
     Throttled to _NOTIFICATION_MIN_GAP_SECS between sends to prevent burst-sends
     during rapid multi-pair activity from triggering per-channel 429 rate limits.
     """
-    if _panel_channel is None:
+    if _signal_channel is None:
         return
 
     now = time.monotonic()
@@ -264,15 +341,13 @@ async def send_trade_notification(action: str, pair: str, pair_state, bot_state,
         last_ts = getattr(_discord_client, "_last_notification_ts", 0.0)
         elapsed = now - last_ts
         if elapsed < _NOTIFICATION_MIN_GAP_SECS:
-            # Brief async sleep to spread notifications across time.
-            # This avoids dropping the notification entirely while staying below rate limit.
             await asyncio.sleep(_NOTIFICATION_MIN_GAP_SECS - elapsed)
         if _discord_client is not None:
             _discord_client._last_notification_ts = time.monotonic()
 
     try:
         embed = build_trade_notification(action, pair, pair_state, bot_state, pl)
-        await _panel_channel.send(embed=embed)
+        await _signal_channel.send(embed=embed)
     except Exception as e:
         logger.error(f"Failed to send trade notification: {e}")
 

@@ -348,7 +348,7 @@ FVG_COOLDOWN_SECONDS = 300      # 5 min between FVG trades on the same pair
 FVG_ORDER_TIMEOUT = 60          # Cancel unfilled limit order after 60 seconds
 INTERVAL_ETHERSCAN = 300        # Etherscan on-chain data (ETH only)
 INTERVAL_FVG = 60              # Fair Value Gap detection per pair (5m candles)
-INTERVAL_DISCORD_PANEL = 30    # Discord panel poll interval — 30 s reduces edit frequency and 429 rate-limit risk
+INTERVAL_DISCORD_PANEL = 45    # 45 s: 4 channels per cycle — stays well under Discord's per-channel rate limit
 INTERVAL_PORTFOLIO_SNAPSHOT = 1800  # Save portfolio snapshot every 30 min
 
 # ─── Discord ─────────────────────────────────────────────────────────────
@@ -364,7 +364,22 @@ OB_FLOW_BEAR = 0.4              # Flow ratio below this = sellers hitting bids �
 OB_SCORE_BOOST = 0.5            # Each bullish signal adds this to effective_score
 OB_EMA_ALPHA = 0.3              # Smoothing alpha (≈ 5-tick period, ~50s at 10s interval)
 
-DISCORD_PANEL_CHANNEL_NAME = "trading-bot"
+DISCORD_PANEL_CHANNEL_NAME = "trading-bot"   # Legacy fallback name (kept for import compat)
+
+# ── Multi-Channel Terminal Topology ──────────────────────────────────────────
+# Each key maps to a Discord channel ID.
+# MAIN    — Active positions + control buttons (Pause, Chart, Abandon…)
+# SIGNALS — Trade ledger: entry/exit notifications, read-only
+# AUDIT   — Entry block reasons (why the bot isn't entering), read-only
+# EQUITY  — Realized PnL, funding costs, win-rate accounting, read-only
+# ADMIN   — System health, uptime, error log, master overrides + buttons
+DISCORD_CHANNELS = {
+    "MAIN":    1486961092906455061,
+    "SIGNALS": 1486961144206856252,
+    "AUDIT":   1486961180529393685,
+    "EQUITY":  1486961201907896410,
+    "ADMIN":   1485302487740055632,
+}
 
 # ─── Binance Endpoints ───────────────────────────────────────────────────
 BINANCE_TESTNET_URL = "https://testnet.binance.vision"
