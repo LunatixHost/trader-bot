@@ -17,6 +17,7 @@ Key safety invariants:
 
 import asyncio
 import logging
+import time as _time
 import ccxt.async_support as ccxt
 
 from config import (
@@ -81,8 +82,14 @@ async def enforce_futures_environment():
     # adjustForTimeDifference in the constructor is passive — it doesn't
     # auto-fetch the offset. Without this, clock skew >1000ms causes -1021.
     try:
-        await exchange.load_time_difference()
-        logger.info("Futures: clock synced with Binance server time")
+        # Sync against the fapi server directly (not the spot server).
+        # load_time_difference() uses api.binance.com which has a different
+        # clock from demo-fapi.binance.com — we must query fapi/v1/time instead.
+        resp = await exchange.fapiPublicGetTime()
+        server_ts = int(resp["serverTime"])
+        local_ts  = int(_time.time() * 1000)
+        exchange.options["timeDifference"] = local_ts - server_ts
+        logger.info(f"Futures: clock synced with demo-fapi server (offset {local_ts - server_ts:+d}ms)")
     except Exception as e:
         logger.warning(f"Futures: clock sync failed (non-fatal): {e}")
 
@@ -141,19 +148,23 @@ async def prepare_market_for_entry(symbol: str, leverage: int | None = None):
 
 # ─── Balance ─────────────────────────────────────────────────────────────────
 
-async def get_futures_usdt_balance() -> float:
-    """Query USDT free balance from the USDⓈ-M futures wallet.
+async def _get_raw_balance() -> list:
+    """Call fapiPrivateV2GetBalance directly — works on demo-fapi and live fapi.
 
-    This is the ONLY balance function used by the futures scalping layer.
-    Base-asset (BTC, ETH, etc.) balances are irrelevant — futures positions
-    are settled entirely in USDT.
-
-    useV2=True forces fapiPrivateV2GetAccount instead of the default
-    fapiPrivateV3GetAccount — v3 does not exist on the futures testnet.
+    fetch_balance() routes to fapiPrivateV2GetAccount which is unavailable on
+    the demo server; the raw balance endpoint works on both environments.
     """
+    return await exchange.fapiPrivateV2GetBalance()
+
+
+async def get_futures_usdt_balance() -> float:
+    """Query USDT free/available balance from the USDⓈ-M futures wallet."""
     try:
-        balance = await exchange.fetch_balance({'type': 'future', 'useV2': True})
-        return float(balance.get('USDT', {}).get('free', 0.0))
+        assets = await _get_raw_balance()
+        for a in assets:
+            if a.get('asset') == 'USDT':
+                return float(a.get('availableBalance', a.get('balance', 0.0)))
+        return 0.0
     except Exception as e:
         logger.error(f"get_futures_usdt_balance failed: {e}")
         return 0.0
@@ -166,10 +177,11 @@ async def get_futures_total_usdt() -> float:
     reported total doesn't shrink every time a position is opened.
     """
     try:
-        balance = await exchange.fetch_balance({'type': 'future', 'useV2': True})
-        usdt = balance.get('USDT', {})
-        total = float(usdt.get('total', usdt.get('free', 0.0)))
-        return total
+        assets = await _get_raw_balance()
+        for a in assets:
+            if a.get('asset') == 'USDT':
+                return float(a.get('balance', 0.0))
+        return 0.0
     except Exception as e:
         logger.error(f"get_futures_total_usdt failed: {e}")
         return 0.0
