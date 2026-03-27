@@ -26,6 +26,16 @@ class BinanceClient:
         self._step_size_cache: dict[str, float] = {}    # pair → stepSize
         self._min_qty_cache: dict[str, float] = {}      # pair → minQty
 
+        # Event-driven execution bridge.
+        # The WebSocket stream enqueues pair symbols here on every price tick.
+        # A dedicated worker in bot.py drains the queue and calls evaluate_and_trade()
+        # immediately — no timer polling needed.
+        # Deduplication: _queued_pairs prevents the same pair from flooding the queue
+        # between evaluations. When a pair is already pending, new ticks are silently
+        # dropped until the worker dequeues and clears the entry.
+        self.price_event_queue: asyncio.Queue = asyncio.Queue()
+        self._queued_pairs: set[str] = set()
+
     # ─── Connection ───────────────────────────────────────────────────
 
     async def connect(self):
@@ -319,6 +329,15 @@ class BinanceClient:
                             if ps.current_price > 0:
                                 ps.prev_price = ps.current_price
                             ps.current_price = price
+
+                            # Signal the execution worker — only if this pair
+                            # is not already waiting in the queue (dedup guard).
+                            # Fast ticks between evaluations are intentionally
+                            # dropped; the worker always reads the latest price
+                            # directly from ps.current_price when it runs.
+                            if pair not in self._queued_pairs:
+                                self._queued_pairs.add(pair)
+                                self.price_event_queue.put_nowait(pair)
             except asyncio.CancelledError:
                 break
             except Exception as e:

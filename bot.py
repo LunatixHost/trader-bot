@@ -1741,28 +1741,41 @@ async def long_term_loop():
 
 # ─── Main Trading Loop ───────────────────────────────────────────────
 
-async def trading_loop():
-    """Main loop — evaluate each pair on its RSI interval.
+async def real_time_execution_worker():
+    """Event-driven trade evaluator — reacts to WebSocket price ticks instantly.
 
-    Responsibilities per cycle:
-    - strategy.get_decision() returns directional intent (BUY / SELL / HOLD)
-    - _get_forced_exit_reason() enforces hard exits (HARD_STOP, TRAIL_STOP,
-      TIME_STOP, MAX_HOLD_EXIT) independently of strategy signals
-    - TP1 partial sell fires before the strategy decision is acted on
-    - execute_buy() / execute_sell() handle actual order placement
+    Replaces the timer-based trading_loop.  Execution latency is now bounded
+    only by asyncio scheduling + lock acquisition, not by a sleep interval.
+
+    Flow:
+      1. BinanceClient._price_stream_loop updates ps.current_price on every tick.
+      2. If the pair is not already pending, it enqueues the pair symbol.
+      3. This worker dequeues and calls evaluate_and_trade() immediately.
+      4. The dedup set in BinanceClient ensures each pair appears at most once
+         in the queue — fast ticks between evaluations are intentionally dropped
+         because evaluate_and_trade always reads the live ps.current_price, so
+         it always acts on the freshest price regardless of how many ticks fired.
+
+    update_portfolio_tracking() is called after each evaluation so portfolio
+    P/L, drawdown, and position counts stay current at tick resolution.
     """
+    log.info("Real-time execution worker started")
     while True:
-        for pair_cfg in TRADING_PAIRS:
-            pair = pair_cfg["pair"]
+        try:
+            pair = await binance.price_event_queue.get()
+            # Clear the dedup entry so the next tick for this pair can be queued
+            binance._queued_pairs.discard(pair)
             try:
                 await evaluate_and_trade(pair)
+                update_portfolio_tracking(state)
             except Exception as e:
-                log.error(f"Trading loop error for {pair}: {e}")
-
-        # Update portfolio tracking
-        update_portfolio_tracking(state)
-
-        await asyncio.sleep(INTERVAL_RSI)
+                log.error(f"Execution worker error for {pair}: {e}")
+            finally:
+                binance.price_event_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Execution worker fatal error: {e}")
 
 
 # ─── Startup ──────────────────────────────────────────────────────────
@@ -1928,8 +1941,8 @@ async def start():
     tasks.append(asyncio.create_task(drawdown_tracking_loop()))
     tasks.append(asyncio.create_task(btc_crash_detection_loop()))
 
-    # Trading loop
-    tasks.append(asyncio.create_task(trading_loop()))
+    # Event-driven execution worker (replaces timer-based trading_loop)
+    tasks.append(asyncio.create_task(real_time_execution_worker()))
 
     # Long-term portfolio layer (separate from scalping, 5-min cycle)
     if LONG_TERM_ENABLED:
