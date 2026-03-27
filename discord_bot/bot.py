@@ -144,15 +144,37 @@ class TradingDiscordBot(discord.Client):
         await self._setup_channels()
 
     async def _setup_channels(self):
-        """Fetch all 5 channels by ID, post initial live panels in MAIN/AUDIT/EQUITY/ADMIN."""
+        """Fetch all 5 channels by ID, rename them to terminal scheme, post panels."""
         global _signal_channel
+
+        # Canonical terminal names for each role
+        _TARGET_NAMES = {
+            "MAIN":    "terminal-main",
+            "SIGNALS": "terminal-signals",
+            "AUDIT":   "terminal-audit",
+            "EQUITY":  "terminal-equity",
+            "ADMIN":   "terminal-admin",
+        }
 
         logger.info("Setting up multi-channel terminal…")
         for key, ch_id in DISCORD_CHANNELS.items():
             try:
                 ch = await self.fetch_channel(ch_id)
                 self._ch[key] = ch
-                logger.info(f"  [{key}] bound → #{ch.name} (id={ch_id})")
+
+                # Rename the channel to its terminal role name if needed
+                target = _TARGET_NAMES[key]
+                if ch.name != target:
+                    try:
+                        await ch.edit(name=target)
+                        logger.info(f"  [{key}] renamed #{ch.name} → #{target}")
+                    except discord.Forbidden:
+                        logger.warning(f"  [{key}] no permission to rename #{ch.name}")
+                    except Exception as e:
+                        logger.warning(f"  [{key}] rename failed: {e}")
+                else:
+                    logger.info(f"  [{key}] bound → #{ch.name} (id={ch_id})")
+
             except discord.Forbidden:
                 logger.error(f"  [{key}] no access to channel {ch_id}")
             except discord.NotFound:
