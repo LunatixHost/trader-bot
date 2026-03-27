@@ -144,9 +144,12 @@ async def get_futures_usdt_balance() -> float:
     This is the ONLY balance function used by the futures scalping layer.
     Base-asset (BTC, ETH, etc.) balances are irrelevant — futures positions
     are settled entirely in USDT.
+
+    useV2=True forces fapiPrivateV2GetAccount instead of the default
+    fapiPrivateV3GetAccount — v3 does not exist on the futures testnet.
     """
     try:
-        balance = await exchange.fetch_balance({'type': 'future'})
+        balance = await exchange.fetch_balance({'type': 'future', 'useV2': True})
         return float(balance.get('USDT', {}).get('free', 0.0))
     except Exception as e:
         logger.error(f"get_futures_usdt_balance failed: {e}")
@@ -160,7 +163,7 @@ async def get_futures_total_usdt() -> float:
     reported total doesn't shrink every time a position is opened.
     """
     try:
-        balance = await exchange.fetch_balance({'type': 'future'})
+        balance = await exchange.fetch_balance({'type': 'future', 'useV2': True})
         usdt = balance.get('USDT', {})
         total = float(usdt.get('total', usdt.get('free', 0.0)))
         return total
