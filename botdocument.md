@@ -1,6 +1,6 @@
 # Trading Bot — Complete Documentation
 
-> Last updated: 2026-03-28 (rev 5)
+> Last updated: 2026-03-28 (rev 6)
 > Mode: **Scalping + Long-Term + Futures (Live)** | Exchange: **Binance USDⓈ-M Futures** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
 
 ---
@@ -772,8 +772,17 @@ margin_locked = $1,333 / 5 = $267   (26.7% of balance)
 ### Testnet Note
 
 Futures testnet API keys are **separate** from spot testnet keys.
-Generate them at: https://testnet.binancefuture.com
-Set as `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` in `.env`.
+Generate them at: https://testnet.binancefuture.com (GitHub login — no Binance account needed).
+The futures testnet comes pre-loaded with ~10,000 USDT.
+
+Set in `.env`:
+```
+BINANCE_FUTURES_API_KEY=your_futures_testnet_key
+BINANCE_FUTURES_SECRET_KEY=your_futures_testnet_secret
+```
+
+`futures_execution.py` reads `BINANCE_FUTURES_API_KEY` / `BINANCE_FUTURES_SECRET_KEY` exclusively.
+`binance_client.py` (WebSocket + REST market data) continues to use `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` (spot testnet or live spot).
 
 ---
 

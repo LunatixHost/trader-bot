@@ -20,7 +20,7 @@ import logging
 import ccxt.async_support as ccxt
 
 from config import (
-    BINANCE_API_KEY, BINANCE_SECRET_KEY, USE_TESTNET,
+    BINANCE_FUTURES_API_KEY, BINANCE_FUTURES_SECRET_KEY, USE_TESTNET,
     FUTURES_LEVERAGE, FUTURES_ACCOUNT_RISK_PCT, STOP_LOSS_PCT,
     ATR_SL_MULTIPLIER, ATR_SL_MAX_PCT,
 )
@@ -34,12 +34,12 @@ logger = logging.getLogger("trading_bot.futures_exec")
 # This single option is what separates "buy BTC" (spot) from "long BTCUSDT perp".
 #
 # NOTE: Futures testnet requires SEPARATE API keys from spot testnet.
-# Generate them at: https://testnet.binancefuture.com
-# Set them as BINANCE_API_KEY / BINANCE_SECRET_KEY in .env for futures testing.
+# Generate them at: https://testnet.binancefuture.com (GitHub login)
+# Set BINANCE_FUTURES_API_KEY / BINANCE_FUTURES_SECRET_KEY in .env.
 
 exchange = ccxt.binance({
-    'apiKey':          BINANCE_API_KEY,
-    'secret':          BINANCE_SECRET_KEY,
+    'apiKey':          BINANCE_FUTURES_API_KEY,
+    'secret':          BINANCE_FUTURES_SECRET_KEY,
     'enableRateLimit': True,
     'options': {
         'defaultType':             'future',   # CRITICAL — USDⓈ-M perpetuals
@@ -48,10 +48,13 @@ exchange = ccxt.binance({
 })
 
 if USE_TESTNET:
-    # Binance futures testnet endpoint
+    # Binance USDⓈ-M futures testnet — separate endpoint and keys from spot testnet.
+    # Keys generated at: https://testnet.binancefuture.com (GitHub login required)
     exchange.urls['api']['fapiPublic']  = 'https://testnet.binancefuture.com/fapi/v1'
     exchange.urls['api']['fapiPrivate'] = 'https://testnet.binancefuture.com/fapi/v1'
-    logger.info("Futures execution: TESTNET mode active")
+    exchange.urls['api']['fapiPublicV2'] = 'https://testnet.binancefuture.com/fapi/v2'
+    exchange.urls['api']['fapiPrivateV2'] = 'https://testnet.binancefuture.com/fapi/v2'
+    logger.info("Futures execution: TESTNET mode active (testnet.binancefuture.com)")
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────

@@ -9,6 +9,10 @@ USE_TESTNET = True  # Switch to False for live trading — NEVER change without 
 # ─── API Keys ────────────────────────────────────────────────────────────
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+# Futures testnet uses separate keys from spot testnet.
+# Generate at: https://testnet.binancefuture.com (GitHub login)
+BINANCE_FUTURES_API_KEY    = os.getenv("BINANCE_FUTURES_API_KEY", "")
+BINANCE_FUTURES_SECRET_KEY = os.getenv("BINANCE_FUTURES_SECRET_KEY", "")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
