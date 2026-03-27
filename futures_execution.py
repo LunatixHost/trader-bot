@@ -72,7 +72,7 @@ async def enforce_futures_environment():
     correct mode; we silently pass that case.
     """
     try:
-        await exchange.fapiPrivate_post_positionside_dual({'dualSidePosition': 'false'})
+        await exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'false'})
         logger.info("Futures: One-Way Mode confirmed")
     except ccxt.ExchangeError as e:
         err_str = str(e)
