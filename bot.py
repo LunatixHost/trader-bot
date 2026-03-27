@@ -1990,6 +1990,7 @@ async def start():
         await futures_execution.enforce_futures_environment()
     except Exception as e:
         log.error(f"Futures environment setup failed: {e} — HALTING startup")
+        await futures_execution.close_exchange()
         return
 
     # Initialise Market Dynamics Engine (DataProvider cache + VolumePairList)

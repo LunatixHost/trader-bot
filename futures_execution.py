@@ -71,6 +71,15 @@ async def enforce_futures_environment():
     Binance returns error -4059 / "No need to change" when already in the
     correct mode; we silently pass that case.
     """
+    # Sync local clock with Binance server time before any signed request.
+    # adjustForTimeDifference in the constructor is passive — it doesn't
+    # auto-fetch the offset. Without this, clock skew >1000ms causes -1021.
+    try:
+        await exchange.load_time_difference()
+        logger.info("Futures: clock synced with Binance server time")
+    except Exception as e:
+        logger.warning(f"Futures: clock sync failed (non-fatal): {e}")
+
     try:
         await exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'false'})
         logger.info("Futures: One-Way Mode confirmed")
