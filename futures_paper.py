@@ -64,10 +64,6 @@ from config import (
     FUTURES_TRIPLE_LONG_BLOCK,
     RSI_SELL_THRESHOLD,
     RSI_BUY_THRESHOLD,
-    OB_IMBALANCE_BEAR,
-    OB_FLOW_BEAR,
-    OB_IMBALANCE_BULL,
-    OB_FLOW_BULL,
     TRADING_PAIRS,
 )
 from state import FuturesPaperState
@@ -151,14 +147,20 @@ def _futures_bearish_score(ps) -> float:
     if getattr(ps, "macd_crossover", "none") == "bearish":
         score += 0.6
 
-    # Weak orderbook (sellers stacking)
+    # Trend confirmation bonus — downtrend is already required for entry,
+    # so this rewards the alignment without changing the entry gate at all.
+    if getattr(ps, "trend", "chop") == "downtrend":
+        score += 0.3
+
+    # Weak orderbook (sellers stacking) — use futures-specific threshold (0.45)
+    # so the score window matches the entry gate, eliminating the 0.40–0.45 dead zone.
     ob = float(getattr(ps, "orderbook_imbalance", 0.5))
-    if ob < OB_IMBALANCE_BEAR:
+    if ob < FUTURES_OB_BEAR_MAX:
         score += 0.5
 
-    # Weak flow (sellers hitting bids)
+    # Weak flow (sellers hitting bids) — same: use FUTURES_FLOW_BEAR_MAX (0.45)
     flow = float(getattr(ps, "flow_ratio", 0.5))
-    if flow < OB_FLOW_BEAR:
+    if flow < FUTURES_FLOW_BEAR_MAX:
         score += 0.5
 
     return score
@@ -204,12 +206,18 @@ def _futures_bullish_score(ps) -> float:
     if getattr(ps, "macd_crossover", "none") == "bullish":
         score += 0.6
 
+    # Trend confirmation bonus — uptrend is already required for LONG entry.
+    if getattr(ps, "trend", "chop") == "uptrend":
+        score += 0.3
+
+    # Strong orderbook — use futures-specific threshold (0.55) to match gate.
     ob = float(getattr(ps, "orderbook_imbalance", 0.5))
-    if ob > OB_IMBALANCE_BULL:
+    if ob > FUTURES_OB_BULL_MIN:
         score += 0.5
 
+    # Strong flow — use FUTURES_FLOW_BULL_MIN (0.55) to match gate.
     flow = float(getattr(ps, "flow_ratio", 0.5))
-    if flow > OB_FLOW_BULL:
+    if flow > FUTURES_FLOW_BULL_MIN:
         score += 0.5
 
     return score
