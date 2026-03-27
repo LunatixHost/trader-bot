@@ -195,6 +195,63 @@ async def poll_rsi(pair: str):
         await asyncio.sleep(INTERVAL_RSI)
 
 
+async def poll_rsi_on_close():
+    """Phase 5: Kline-close triggered indicator recalculation.
+
+    Drains binance.kline_close_queue and fires a full indicator recalc for the
+    pair whose candle just closed.  Fires at candle-close T+0 (WebSocket push)
+    instead of waiting up to INTERVAL_RSI seconds for the REST poll to wake up.
+
+    Coexists with poll_rsi — if the kline stream misses a close or reconnects,
+    poll_rsi still recalculates on its 10-second timer as a fallback.
+    """
+    log.info("Kline-close indicator worker started (Phase 5)")
+    while True:
+        try:
+            pair = await binance.kline_close_queue.get()
+            try:
+                if pair not in state.pairs:
+                    continue
+                result = await fetch_technical_indicators(
+                    binance, pair, data_provider=data_provider
+                )
+                async with state.lock:
+                    ps = state.pairs[pair]
+                    ps.rsi              = result["rsi"]
+                    ps.macd             = result["macd"]
+                    ps.macd_signal      = result["macd_signal"]
+                    ps.macd_histogram   = result["macd_histogram"]
+                    ps.macd_crossover   = result["macd_crossover"]
+                    ps.bb_upper         = result["bb_upper"]
+                    ps.bb_middle        = result["bb_middle"]
+                    ps.bb_lower         = result["bb_lower"]
+                    ps.bb_position      = result["bb_position"]
+                    ps.bb_squeeze       = result["bb_squeeze"]
+                    ps.atr              = result.get("atr", 0.0)
+                    ps.atr_pct          = result.get("atr_pct", 0.0)
+                    ps.avg_atr_20       = result.get("avg_atr_20", 0.0)
+                    ps.trend_strength   = result.get("trend_strength", 0.0)
+                    ps.trend_direction  = result.get("trend_direction", "flat")
+                    ps.regime           = result.get("regime", "ranging")
+                    td = ps.trend_direction
+                    ps.trend = "uptrend" if td == "up" else ("downtrend" if td == "down" else "chop")
+                    ps.wick_ratio       = result.get("wick_ratio", 0.0)
+                    ps.candle_range_pct = result.get("candle_range_pct", 0.0)
+                    ps.liquidity_sweep_score = result.get("liquidity_sweep_score", 0.0)
+                    ps.structure_score  = result.get("structure_score", 0.0)
+                    ps.volatility_score = result.get("volatility_score", 0.0)
+                    _update_dynamic_params(ps)
+                log.debug(f"Kline-close recalc {pair}: RSI={result['rsi']:.1f}")
+            except Exception as e:
+                log.error(f"Kline-close recalc error for {pair}: {e}")
+            finally:
+                binance.kline_close_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Kline-close worker error: {e}")
+
+
 def _update_dynamic_params(ps):
     """Recalculate per-pair dynamic parameters from current market state.
 
@@ -765,6 +822,12 @@ def get_entry_block_reason(ps, state) -> str | None:
     crash_modifier = BTC_CRASH_SIZE_MULTIPLIER if state.btc_crash_active else 1.0
     downtrend_modifier = DOWNTREND_SIZE_MULTIPLIER if getattr(ps, "trend", "") == "downtrend" else 1.0
     trade_size *= size_modifier * corr_modifier * btc_cluster_modifier * crash_modifier * downtrend_modifier
+    # Phase 4: Inverse volatility sizing — keep dollar risk flat across SL widths.
+    # When ATR widens the SL (volatile market), shrink the position proportionally so
+    # the max dollar loss stays constant.  vol_adj = 1.0 in quiet markets.
+    if ps.atr_pct > 0:
+        _atr_sl = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, ps.atr_pct * ATR_SL_MULTIPLIER * 100))
+        trade_size *= STOP_LOSS_PCT / _atr_sl
     if min(trade_size, spendable, room) < MIN_TRADE_NOTIONAL:
         return "min_notional"
 
@@ -926,6 +989,10 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
     crash_modifier = BTC_CRASH_SIZE_MULTIPLIER if state.btc_crash_active else 1.0
     downtrend_modifier = DOWNTREND_SIZE_MULTIPLIER if getattr(ps, "trend", "") == "downtrend" else 1.0
     trade_size *= size_modifier * corr_modifier * btc_cluster_modifier * crash_modifier * downtrend_modifier
+    # Phase 4: Inverse volatility sizing — constant dollar risk across all regimes.
+    if ps.atr_pct > 0:
+        _atr_sl = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, ps.atr_pct * ATR_SL_MULTIPLIER * 100))
+        trade_size *= STOP_LOSS_PCT / _atr_sl
 
     max_position = state.portfolio_total_usdt * MAX_POSITION_PCT
     current_position = ps.asset_balance * ps.current_price if ps.current_price > 0 else 0
@@ -1928,8 +1995,10 @@ async def start():
                 state.pairs[pair].current_price = price
             log.info(f"  {pair}: ${price:,.4f}")
 
-    # Start WebSocket price streams
+    # Start WebSocket price streams (tick-level price updates)
     await binance.start_price_streams(state)
+    # Phase 5: Start kline-close streams (fires indicator recalc at candle T+0)
+    await binance.start_kline_streams(interval="3m")
 
     # Start signal polling tasks for each pair — staggered to avoid rate limits
     tasks = []
@@ -1956,6 +2025,8 @@ async def start():
 
     # Event-driven execution worker (replaces timer-based trading_loop)
     tasks.append(asyncio.create_task(real_time_execution_worker()))
+    # Phase 5: Kline-close indicator worker (fires recalc at exact candle close)
+    tasks.append(asyncio.create_task(poll_rsi_on_close()))
 
     # Long-term portfolio layer (separate from scalping, 5-min cycle)
     if LONG_TERM_ENABLED:

@@ -36,6 +36,12 @@ class BinanceClient:
         self.price_event_queue: asyncio.Queue = asyncio.Queue()
         self._queued_pairs: set[str] = set()
 
+        # Phase 5: Kline-close event queue.
+        # Each entry is a pair symbol whose 3-minute candle just officially closed.
+        # poll_rsi_on_close() drains this queue and recalculates indicators immediately
+        # at T+0 of the closed candle rather than waiting for the next 10s REST poll.
+        self.kline_close_queue: asyncio.Queue = asyncio.Queue()
+
     # ─── Connection ───────────────────────────────────────────────────
 
     async def connect(self):
@@ -344,6 +350,60 @@ class BinanceClient:
                 logger.error(f"WS stream error for {pair}: {e}")
                 if self._running:
                     await asyncio.sleep(5)  # Wait before reconnect
+
+    # ─── Kline-close streams (Phase 5) ────────────────────────────────
+
+    async def start_kline_streams(self, interval: str = "3m"):
+        """Subscribe to kline streams for every configured pair.
+
+        Pushes the pair symbol into kline_close_queue ONLY when
+        `kline['x'] == True` (the candle has officially closed).
+        A separate worker in bot.py drains this queue and recalculates
+        indicators immediately at candle-close T+0 instead of waiting
+        for the next INTERVAL_RSI REST poll (up to 10s later).
+        """
+        for pair_cfg in TRADING_PAIRS:
+            symbol = pair_cfg["pair"].lower()
+            task = asyncio.create_task(
+                self._kline_stream_loop(symbol, pair_cfg["pair"], interval)
+            )
+            self._ws_tasks.append(task)
+        logger.info(
+            f"Started kline-close WebSocket streams ({interval}) "
+            f"for {len(TRADING_PAIRS)} pairs"
+        )
+
+    async def _kline_stream_loop(self, symbol_lower: str, pair: str, interval: str):
+        """Single-pair kline WebSocket with auto-reconnect.
+
+        Only enqueues on confirmed candle close (kline['x'] is True).
+        Mid-candle ticks are silently ignored — REST polling still handles
+        those via poll_rsi's INTERVAL_RSI sleep; this stream is purely
+        an acceleration trigger at the close boundary.
+        """
+        while self._running:
+            try:
+                async with self.bsm.kline_socket(symbol_lower, interval=interval) as stream:
+                    while self._running:
+                        msg = await stream.recv()
+                        if msg is None:
+                            break
+                        if "e" in msg and msg["e"] == "error":
+                            logger.error(f"Kline WS error for {pair}: {msg}")
+                            break
+                        kline = msg.get("k", {})
+                        if kline.get("x", False):   # x = is_final (candle closed)
+                            close_price = float(kline.get("c", 0))
+                            logger.debug(
+                                f"Kline closed {pair} @ ${close_price:,.4f}"
+                            )
+                            self.kline_close_queue.put_nowait(pair)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Kline WS stream error for {pair}: {e}")
+                if self._running:
+                    await asyncio.sleep(5)
 
     # ─── Helpers ──────────────────────────────────────────────────────
 
