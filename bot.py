@@ -161,6 +161,8 @@ async def poll_rsi(pair: str):
                 ps.wick_ratio = result.get("wick_ratio", 0.0)
                 ps.candle_range_pct = result.get("candle_range_pct", 0.0)
                 ps.liquidity_sweep_score = result.get("liquidity_sweep_score", 0.0)
+                ps.structure_score = result.get("structure_score", 0.0)
+                ps.volatility_score = result.get("volatility_score", 0.0)
                 # Update ATR trailing stop if holding a position
                 if ps.asset_balance > 0 and ps.atr > 0 and USE_ATR_EXITS and ps.buy_price > 0:
                     gain_pct = (ps.current_price - ps.buy_price) / ps.buy_price * 100
@@ -628,28 +630,27 @@ def _should_allow_signal_sell(ps) -> bool:
     hold_minutes = m["hold_minutes"]
     hard_exit_minutes = m["hard_exit_minutes"]
 
-    # Current profit clears round-trip costs — allow the signal sell.
-    # 0.25% gross - 0.25% round-trip fees ≈ break-even; anything above is net-positive.
-    # Was 0.08% which was structurally net-negative after fees.
-    if pnl_pct >= 0.25:
+    # Current profit clears fees and leaves net gain — allow the signal sell.
+    # Raised from 0.25% to 0.40%: matches new SCALP_SMALL_PROFIT_LOW.
+    # 0.40% gross - 0.25% round-trip = 0.15% net minimum.
+    if pnl_pct >= 0.40:
         return True
 
     # Trade peaked meaningfully and has retraced — protect what remains.
-    # Peak must reach 0.30% to confirm the trade had real profit before this gate fires.
-    # Was 0.15% — too small a peak; exits were harvesting sub-break-even gross gains.
+    # Peak must reach 0.50% (aligned with new TP1) before this gate fires.
     peak_gain = getattr(ps, "peak_gain_pct", 0.0)
-    if peak_gain >= 0.30:
+    if peak_gain >= 0.50:
         return True
 
     # Time-based escape: stale trade with any green past the hold window
     if hold_minutes >= hard_exit_minutes and pnl_pct > 0:
         return True
 
-    # Score-collapse escape: trade has meaningful gain but the setup has deteriorated sharply.
-    # Raised from 0.10% to 0.22% to keep this escape above effective fee break-even.
+    # Score-collapse escape: trade has meaningful gain but setup has deteriorated sharply.
+    # Raised from 0.22% to 0.40% to keep above the new fee break-even level.
     eff = getattr(ps, "effective_score", 0.0)
     thr = ps.dynamic_params.get("effective_threshold", CONFIDENCE_BUY_THRESHOLD)
-    if pnl_pct > 0.22 and eff < thr - 1.0:
+    if pnl_pct > 0.40 and eff < thr - 1.0:
         return True
 
     return False

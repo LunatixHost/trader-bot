@@ -50,6 +50,12 @@ def _default_result() -> dict:
         "regime": "ranging",
         # Liquidity sweep scoring
         "liquidity_sweep_score": 0.0,
+        # Price-action structure score (volume + candle direction)
+        # Range: ~-1.0 to +1.5.  Feeds directly into strategy.py effective_score.
+        "structure_score": 0.0,
+        # Volatility expansion score (Bollinger Band width change)
+        # Range: ~-0.3 to +0.5.  Positive = bands expanding = breakout potential.
+        "volatility_score": 0.0,
     }
 
 
@@ -295,6 +301,55 @@ async def fetch_technical_indicators(
                     result["liquidity_sweep_score"] = 0.0
         except Exception as e:
             logger.warning(f"Liquidity sweep calc failed for {pair}: {e}")
+
+        # ── Structure Score (volume confirmation + candle direction) ──
+        # Three components, each contributes roughly -0.5 to +0.5:
+        #   vol_score:   current volume vs 20-period mean (buying pressure)
+        #   body_score:  candle body direction and strength
+        #   close_score: close position within candle range (upper = bullish)
+        # Net range: approximately -1.0 to +1.5
+        try:
+            vol_mean = float(df["volume"].iloc[-20:].mean()) if len(df) >= 20 else float(df["volume"].mean())
+            vol_ratio = float(df["volume"].iloc[-1]) / vol_mean if vol_mean > 0 else 1.0
+
+            last_body  = float(df["close"].iloc[-1]) - float(df["open"].iloc[-1])
+            last_range = float(df["high"].iloc[-1])  - float(df["low"].iloc[-1])
+            is_bullish = last_body > 0
+
+            # Volume score is DIRECTIONAL: high volume on a bullish candle = accumulation (+).
+            # High volume on a bearish candle = distribution/panic (-).
+            # Avoids scoring crash candles as bullish just because sellers are active.
+            if is_bullish:
+                vol_score = min(0.6, max(0.0, (vol_ratio - 1.0) * 0.4))
+            else:
+                vol_score = min(0.0, max(-0.3, (vol_ratio - 1.0) * -0.2))
+
+            body_ratio = last_body / last_range if last_range > 0 else 0.0
+            body_score = max(-0.5, min(0.5, body_ratio * 0.6))
+
+            last_close_pos = (
+                (float(df["close"].iloc[-1]) - float(df["low"].iloc[-1])) / last_range
+                if last_range > 0 else 0.5
+            )
+            close_score = (last_close_pos - 0.5) * 0.4   # -0.2 to +0.2
+
+            result["structure_score"] = round(vol_score + body_score + close_score, 3)
+        except Exception as e:
+            logger.warning(f"structure_score calculation failed for {pair}: {e}")
+
+        # ── Volatility Score (Bollinger Band expansion) ──
+        # Positive when bands are expanding relative to 5 candles ago —
+        # indicates a breakout is starting, confirming momentum behind the move.
+        try:
+            if result["bb_middle"] > 0 and len(df) >= 10:
+                bw_now = (result["bb_upper"] - result["bb_lower"]) / result["bb_middle"]
+                bb_u5, bb_m5, bb_l5 = _manual_bbands(df["close"].iloc[:-5])
+                if not bb_m5.empty and float(bb_m5.iloc[-1]) > 0:
+                    bw_5 = (float(bb_u5.iloc[-1]) - float(bb_l5.iloc[-1])) / float(bb_m5.iloc[-1])
+                    expansion = (bw_now - bw_5) / bw_5 if bw_5 > 0 else 0.0
+                    result["volatility_score"] = round(max(-0.3, min(0.5, expansion * 5.0)), 3)
+        except Exception as e:
+            logger.warning(f"volatility_score calculation failed for {pair}: {e}")
 
         # Cache as last known value
         _last_known[pair] = result

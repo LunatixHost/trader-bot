@@ -512,15 +512,14 @@ class BacktestEngine:
         fee_pct: float = ROUND_TRIP_COST_PCT / 2,
         slippage_pct: float = 0.0,
         verbose: bool = True,
-        threshold_scale: float = 0.65,
+        threshold_scale: float = 1.0,
     ):
         # threshold_scale: multiplied onto CONFIDENCE_BUY_THRESHOLD after
-        # _update_dynamic_params_sim(). Compensates for structure_score and
-        # volatility_score being unimplemented in the live bot (always 0.0).
-        # Those fields were intended to contribute ~1 pt to effective score;
-        # without them the max achievable effective = ~1.8 vs threshold 2.7.
-        # 0.65 → threshold = 2.7 × 0.65 = ~1.75, just below max signal output.
-        # Override with --threshold-scale on the CLI to test other levels.
+        # _update_dynamic_params_sim(). Now defaults to 1.0 because structure_score
+        # and volatility_score are properly computed from candle data in
+        # signals/rsi.py, making the full effective score range ~0 to 3.0 — enough
+        # to clear CONFIDENCE_BUY_THRESHOLD=2.0 on genuine confluence setups.
+        # Override with --threshold-scale on the CLI for sensitivity testing.
         self.threshold_scale = threshold_scale
         self.df              = df
         self.pair            = pair
@@ -832,6 +831,8 @@ class BacktestEngine:
             ps.wick_ratio        = indicators.get("wick_ratio", 0.0)
             ps.candle_range_pct  = indicators.get("candle_range_pct", 0.0)
             ps.liquidity_sweep_score = indicators.get("liquidity_sweep_score", 0.0)
+            ps.structure_score   = indicators.get("structure_score", 0.0)
+            ps.volatility_score  = indicators.get("volatility_score", 0.0)
 
             # Neutral microstructure defaults (no live orderbook in backtest)
             ps.orderbook_imbalance = 0.5
@@ -1165,10 +1166,10 @@ async def main():
         help="One-way slippage %%. Default: 0 (conservative estimate: try 0.03)"
     )
     parser.add_argument(
-        "--threshold-scale", type=float, default=0.65, dest="threshold_scale",
-        help="Scale factor applied to CONFIDENCE_BUY_THRESHOLD (default 0.65). "
-             "Compensates for structure_score/volatility_score being unimplemented "
-             "in the live bot (always 0). 0.65 -> threshold ~1.75 vs max score ~1.8."
+        "--threshold-scale", type=float, default=1.0, dest="threshold_scale",
+        help="Scale factor applied to CONFIDENCE_BUY_THRESHOLD (default 1.0). "
+             "structure_score and volatility_score are now computed from candle data, "
+             "so no scaling is needed. Use values < 1.0 only for sensitivity testing."
     )
     parser.add_argument(
         "--summary-only", action="store_true",

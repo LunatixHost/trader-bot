@@ -14,11 +14,12 @@ DISCORD_OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
 # ─── Signal Thresholds ───────────────────────────────────────────────────
-RSI_BUY_THRESHOLD = 55          # RSI below this = oversold = buy signal (raised from 45 → more frequent entries)
-RSI_SELL_THRESHOLD = 70         # RSI above this = overbought = sell signal (raised from 65 → hold deeper into momentum)
+RSI_BUY_THRESHOLD = 48          # RSI below this = oversold = buy signal (lowered from 55 → genuine oversold only)
+RSI_SELL_THRESHOLD = 70         # RSI above this = overbought = sell signal
 VOLUME_SPIKE_MULTIPLIER = 1.5   # Volume 1.5x the average = spike
-CONFIDENCE_BUY_THRESHOLD = 2.7  # Min weighted score to trigger a buy (base; dynamic params scale it)
-STOP_LOSS_PCT = 0.6             # Hard stop-loss: tighter for scalping; keeps losers smaller than prior 1.0%
+CONFIDENCE_BUY_THRESHOLD = 2.0  # Min weighted score to trigger a buy (lowered from 2.7 — recalibrated now that
+                                 # structure_score and volatility_score are computed from candle data, max effective ~3.0)
+STOP_LOSS_PCT = 0.5             # Hard stop-loss: tightened from 0.6 — smaller losers, better R/R
 PROFIT_TARGET_PCT = 1.2         # Fallback TP when ATR exits are off
 
 # ─── ATR-Based Exits (replaces fixed TP for adaptive exits) ─────────────
@@ -36,16 +37,15 @@ USE_ATR_EXITS = True            # True = ATR-based exits, False = fixed % exits
 #   Total: ~0.25% round-trip cost
 # A trade must have realistic expected profit ABOVE this to be worthwhile.
 ROUND_TRIP_COST_PCT = 0.25      # Assumed total round-trip cost (fee + slippage)
-ECONOMIC_MIN_REWARD_PCT = 0.35  # Minimum expected reward for a setup to be economically viable
-                                # = ROUND_TRIP_COST_PCT + ~0.10% buffer
+ECONOMIC_MIN_REWARD_PCT = 0.50  # Minimum expected reward for a setup to be economically viable
+                                # Raised from 0.35 → 0.50: aligns with new BASE_TP1_PCT=0.6%
                                 # ATR × ATR_TP_MULTIPLIER × 100 must clear this before entry
 
 # ─── Scalp TP/SL Ladder ──────────────────────────────────────────────
-BASE_TP1_PCT = 0.35             # TP1 raised from 0.25% to clear round-trip costs at even minimum momentum_factor
-                                # 0.35 × 0.75 (min momentum) = 0.2625% — above 0.25% break-even
+BASE_TP1_PCT = 0.6              # TP1 raised from 0.35% — 0.6% gross leaves ~0.35% net after fees; meaningful profit
 TP1_SELL_RATIO = 0.5            # Sell half at TP1; let the rest run
-BREAKEVEN_BUFFER_PCT = 0.15     # Move SL to entry +0.15% after TP1 (was 0.10%) — gives remaining position more buffer
-TRAILING_ACTIVATION_PCT = 0.35  # Post-TP1 tight trailing: aligned with new TP1 level (was 0.25%)
+BREAKEVEN_BUFFER_PCT = 0.20     # Move SL to entry +0.20% after TP1 (raised from 0.15%) — more cushion on the runner
+TRAILING_ACTIVATION_PCT = 0.6   # Post-TP1 tight trailing: aligned with new TP1 level
 TRAILING_DISTANCE_PCT = 0.25    # Post-TP1 trail distance: 0.25% below current price
 
 # ─── Velocity Exits (Kill Stagnation) ────────────────────────────────
@@ -56,8 +56,8 @@ HARD_EXIT_PL_THRESHOLD_PCT = 0.15  # Dead trades should show some progress quick
 SCALP_MICRO_TP_PCT       = 0.35  # Micro TP aligned with new BASE_TP1_PCT (documentation only)
 SCALP_HARD_TP_PCT        = 1.2   # Hard ceiling for stronger winners (unchanged)
 SCALP_SOFT_TP_PCT        = 0.5   # Soft TP after a meaningful move (was 0.7%)
-SCALP_SMALL_PROFIT_LOW   = 0.25  # Signal-sell floor: gross gain must clear round-trip costs (was 0.08%)
-SCALP_SMALL_PROFIT_HIGH  = 0.35  # Signal-sell target: aligned with new TP1 (was 0.25%)
+SCALP_SMALL_PROFIT_LOW   = 0.40  # Signal-sell floor: raised from 0.25% — enforces fee-clearing minimum
+SCALP_SMALL_PROFIT_HIGH  = 0.60  # Signal-sell target: aligned with new TP1
 SCALP_EARLY_STAG_MINUTES_T1 = 6  # Slightly more room before killing dead trades
 SCALP_EARLY_STAG_MIN_PCT_T1 = 0.05  # Truly dead trades only
 SCALP_EARLY_STAG_MINUTES = 10     # Give good setups a bit more time
