@@ -161,6 +161,12 @@ class PairState:
     position_open_time: str = ""       # ISO timestamp when current position was opened
     peak_gain_pct: float = 0.0         # Highest unrealised gain % since entry (profit protection)
 
+    # Futures position tracking (replaces spot asset_balance semantics)
+    # position_side: "long" when a long is open, "short" for short, "none" when flat
+    # leverage: leverage multiplier used on the current position (0 = no position)
+    position_side: str = "none"        # "long" | "short" | "none"
+    leverage: int = 0                  # Leverage used on current position (0 = flat)
+
     # Failed-exit re-entry suppression (pair-specific)
     last_failed_exit_reason: str = ""  # Most recent failed-exit action (EARLY_STAGNATION, TRAIL_STOP, HARD_STOP)
     last_failed_exit_time: str = ""    # ISO timestamp of that exit — cooldown measured from here

@@ -56,8 +56,11 @@ from config import (
     LONG_TERM_ENTRY_THRESHOLD, LONG_TERM_EXIT_THRESHOLD,
     LONG_TERM_CHECK_INTERVAL, LONG_TERM_DOWNTREND_EXIT_CYCLES,
     FUTURES_PAPER_ENABLED,
+    FUTURES_LEVERAGE, FUTURES_ACCOUNT_RISK_PCT,
+    FUTURES_MAKER_FEE, FUTURES_TAKER_FEE,
     get_base_asset,
 )
+import futures_execution
 from binance_client import binance, ExecutionError
 from signals.fvg import detect_fvg
 from state import BotState, LongTermState, FuturesPaperState, create_bot_state, load_state_from_db, save_state_to_db
@@ -410,15 +413,16 @@ async def portfolio_rebalance_loop():
     """
     while True:
         try:
-            # Re-sync USDT balance from Binance (fixes fee drift and testnet quirks)
-            usdt = await binance.get_balance("USDT")
+            # Re-sync USDT balance from the USDⓈ-M futures wallet.
+            # Futures positions are USDT-settled — we never query base-asset balances.
+            usdt = await futures_execution.get_futures_usdt_balance()
             async with state.lock:
-                # Guard: never overwrite a valid balance with zero (API error / testnet glitch)
+                # Guard: never overwrite a valid balance with zero (API error / network blip)
                 if usdt > 0:
                     state.usdt_balance = usdt
                 else:
                     log.warning(
-                        "portfolio_rebalance_loop: get_balance returned 0 — "
+                        "portfolio_rebalance_loop: futures USDT balance returned 0 — "
                         "keeping previous usdt_balance to avoid false drawdown"
                     )
 
@@ -959,8 +963,30 @@ async def evaluate_and_trade(pair: str):
                 await execute_sell(pair, note="SIGNAL_SELL", signal_snapshot=signal_snapshot)
 
 
+def _clear_position_state(ps) -> None:
+    """Reset all position fields to flat state.
+
+    Called after a full position close (execute_sell) or dust guard.
+    Centralised here so the same cleanup runs from both execute_sell and
+    execute_partial_sell (when the last contracts are cleared).
+    """
+    ps.asset_balance    = 0.0
+    ps.buy_price        = 0.0
+    ps.trailing_stop    = 0.0
+    ps.atr_take_profit  = 0.0
+    ps.position_open_time = ""
+    ps.tp1_hit          = False
+    ps.fvg_entry        = False
+    ps.fvg_detected     = False
+    ps.fvg_limit_active = False
+    ps.fvg_order_id     = 0
+    ps.peak_gain_pct    = 0.0
+    ps.position_side    = "none"   # mark flat — no reduceOnly exits until next entry
+    ps.leverage         = 0
+
+
 async def execute_buy(pair: str, signal_snapshot: dict | None = None):
-    """Execute a small market buy for a pair (scalping style)."""
+    """Open a LONG USDⓈ-M futures position (scalping style)."""
     ps = state.pairs[pair]
 
     # Single canonical gate — all pre-buy blockers checked here.
@@ -1066,13 +1092,41 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
                             )
                             is_fvg_early_entry = True
 
-    order = await binance.place_market_buy(pair, usdt_to_spend)
+    # ── Futures execution: calculate contract size from ATR-based SL ──────
+    # Dynamic SL price mirrors the Triple Barrier lower barrier (Phase 2).
+    if ps.atr_pct > 0:
+        _atr_sl_pct = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, ps.atr_pct * ATR_SL_MULTIPLIER * 100))
+    else:
+        _atr_sl_pct = STOP_LOSS_PCT
+
+    entry_price_est = ps.current_price
+    sl_price = entry_price_est * (1 - _atr_sl_pct / 100)
+
+    # Re-query live futures USDT balance for accurate sizing
+    live_usdt = await futures_execution.get_futures_usdt_balance()
+    if live_usdt <= 0:
+        live_usdt = state.usdt_balance  # fallback to last known
+
+    contracts = futures_execution.calculate_futures_position_size(
+        live_usdt, entry_price_est, sl_price
+    )
+
+    if contracts <= 0:
+        log.debug(f"  {ps.base_asset} futures contract size = 0 — skipping")
+        return
+
+    order = await futures_execution.execute_futures_entry(pair, "buy", contracts, FUTURES_LEVERAGE)
     if order is None:
         return
 
-    filled_qty = float(order.get("executedQty", 0))
-    filled_usdt = float(order.get("cummulativeQuoteQty", 0))
-    avg_price = filled_usdt / filled_qty if filled_qty > 0 else ps.current_price
+    filled_qty  = float(order.get("filled") or order.get("amount") or contracts)
+    avg_price   = float(order.get("average") or order.get("price") or entry_price_est)
+    if avg_price <= 0:
+        avg_price = entry_price_est
+    filled_usdt = filled_qty * avg_price
+
+    # Re-sync USDT balance after order (margin has been locked)
+    new_usdt = await futures_execution.get_futures_usdt_balance()
 
     async with state.lock:
         had_position = ps.asset_balance > 0
@@ -1082,6 +1136,8 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
         total_cost = old_cost + filled_usdt
         ps.buy_price = total_cost / ps.asset_balance if ps.asset_balance > 0 else avg_price
         ps.position_value_usdt = ps.asset_balance * avg_price
+        ps.position_side = "long"          # track direction for reduceOnly exits
+        ps.leverage = FUTURES_LEVERAGE
 
         if USE_ATR_EXITS and ps.atr > 0:
             initial_trail = avg_price - ps.atr * ATR_TRAILING_MULTIPLIER
@@ -1108,11 +1164,17 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
         ps.fvg_detected = False
         ps.fvg_limit_active = False
         ps.fvg_order_id = 0
-        state.usdt_balance -= filled_usdt
+
+        # Update USDT balance — prefer live re-query, fallback to margin estimate
+        if new_usdt > 0:
+            state.usdt_balance = new_usdt
+        else:
+            margin_used = filled_usdt / FUTURES_LEVERAGE
+            state.usdt_balance = max(0.0, state.usdt_balance - margin_used)
         state.total_trades += 1
         state.total_buys += 1
 
-    fee_est = filled_usdt * 0.001
+    fee_est = filled_usdt * FUTURES_TAKER_FEE
     exit_info = ""
     if USE_ATR_EXITS and ps.atr > 0:
         exit_info = f" | Trail: ${ps.trailing_stop:.2f}  TP: ${ps.atr_take_profit:.2f}"
@@ -1141,62 +1203,44 @@ async def execute_buy(pair: str, signal_snapshot: dict | None = None):
 
 
 async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None = None):
-    """Execute a full market sell for a pair."""
+    """Close the open LONG futures position for a pair (reduceOnly market order)."""
     ps = state.pairs[pair]
-    if ps.asset_balance <= 0:
+    if ps.asset_balance <= 0 or ps.position_side == "none":
         return
 
-    sell_amount = ps.asset_balance
+    position_side = ps.position_side    # "long" (or "short" when SHORT signals are added)
+    sell_amount   = ps.asset_balance
     current_price = ps.current_price
 
+    # Dust guard: sub-$5 notional positions have no fillable value on futures
     if current_price > 0 and sell_amount * current_price < 5.0:
         async with state.lock:
             log.warning(
                 f"  {ps.base_asset} dust pre-cleared "
                 f"(${sell_amount * current_price:.4f} < $5 min notional — removing from state)"
             )
-            ps.asset_balance = 0.0
-            ps.buy_price = 0.0
-            ps.trailing_stop = 0.0
-            ps.atr_take_profit = 0.0
-            ps.position_open_time = ""
-            ps.tp1_hit = False
-            ps.fvg_entry = False
-            ps.peak_gain_pct = 0.0
+            _clear_position_state(ps)
         update_portfolio_tracking(state)
         return
 
-    try:
-        order = await binance.place_market_sell(pair, sell_amount, current_price=current_price)
-    except ExecutionError as e:
-        log.warning(f"  {ps.base_asset} dust guard: {e}")
-        async with state.lock:
-            ps.asset_balance = 0.0
-            ps.buy_price = 0.0
-            ps.trailing_stop = 0.0
-            ps.atr_take_profit = 0.0
-            ps.position_open_time = ""
-            ps.tp1_hit = False
-            ps.fvg_entry = False
-            ps.peak_gain_pct = 0.0
-        return
+    order = await futures_execution.execute_futures_exit(pair, position_side, sell_amount)
+
     if order is None:
-        if current_price > 0 and ps.asset_balance * current_price < 5.0:
-            async with state.lock:
-                log.warning(f"  {ps.base_asset} dust cleared (${ps.asset_balance * current_price:.4f} < $5)")
-                ps.asset_balance = 0.0
-                ps.buy_price = 0.0
-                ps.trailing_stop = 0.0
-                ps.atr_take_profit = 0.0
-                ps.position_open_time = ""
-                ps.tp1_hit = False
-                ps.fvg_entry = False
-                ps.peak_gain_pct = 0.0
+        # Exit call failed — clear state anyway to prevent zombie positions.
+        # Log loudly; operator should verify on exchange.
+        log.error(
+            f"  {ps.base_asset} futures exit FAILED — clearing local state. "
+            f"VERIFY POSITION ON EXCHANGE MANUALLY."
+        )
+        async with state.lock:
+            _clear_position_state(ps)
         return
 
-    filled_qty = float(order.get("executedQty", 0))
-    filled_usdt = float(order.get("cummulativeQuoteQty", 0))
-    avg_price = filled_usdt / filled_qty if filled_qty > 0 else ps.current_price
+    filled_qty  = float(order.get("filled") or sell_amount)
+    avg_price   = float(order.get("average") or current_price)
+    if avg_price <= 0:
+        avg_price = current_price
+    filled_usdt = filled_qty * avg_price
 
     # Capture entry_time before the lock block clears ps.position_open_time
     entry_time = ps.position_open_time or ""
@@ -1211,23 +1255,18 @@ async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None =
             pass
 
     cost_basis = ps.buy_price * filled_qty if ps.buy_price > 0 else 0
+    # P/L for LONG: profit when exit price > entry price.
+    # For SHORT exits the sign is reversed — handled when SHORT signals are added.
     pl = filled_usdt - cost_basis
     pl_pct = (pl / cost_basis * 100) if cost_basis > 0 else 0.0
+
+    # Re-sync futures USDT balance after the exit (margin returned + P/L settled)
+    new_usdt = await futures_execution.get_futures_usdt_balance()
 
     async with state.lock:
         ps.asset_balance -= filled_qty
         if ps.asset_balance < 1e-6:
-            ps.asset_balance = 0.0
-            ps.buy_price = 0.0
-            ps.trailing_stop = 0.0
-            ps.atr_take_profit = 0.0
-            ps.position_open_time = ""
-            ps.tp1_hit = False
-            ps.fvg_entry = False
-            ps.fvg_detected = False
-            ps.fvg_limit_active = False
-            ps.fvg_order_id = 0
-            ps.peak_gain_pct = 0.0
+            _clear_position_state(ps)
         ps.position_value_usdt = ps.asset_balance * avg_price
         ps.pl_usdt += pl
         ps.pl_pct = pl_pct
@@ -1243,7 +1282,12 @@ async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None =
             "time": now_iso,
         }
         ps.last_trade_time = now_iso
-        state.usdt_balance += filled_usdt
+
+        # Use live balance; fall back to estimate if re-query failed
+        if new_usdt > 0:
+            state.usdt_balance = new_usdt
+        else:
+            state.usdt_balance += filled_usdt
         state.total_trades += 1
         state.total_sells += 1
         if pl > 0:
@@ -1291,60 +1335,64 @@ async def execute_sell(pair: str, note: str = "", signal_snapshot: dict | None =
 
 
 async def execute_partial_sell(pair: str, fraction: float):
-    """Sell `fraction` (0–1) of the current position for TP1 ladder.
+    """Close `fraction` (0–1) of the open LONG position for TP1 ladder.
 
-    Applies stepSize truncation to avoid dust and enforces the $15 notional gate.
-    After a successful TP1 sell:
+    Uses a reduceOnly market order so a retry cannot reverse into a Short.
+    After a successful TP1 partial close:
       - Sets ps.tp1_hit = True
-      - Moves stop-loss to entry + BREAKEVEN_BUFFER_PCT
+      - Moves stop-loss to entry + BREAKEVEN_BUFFER_PCT (breakeven lock)
+
+    Falls back to a full exit if the partial notional is below $5.
     """
     ps = state.pairs[pair]
-    if ps.asset_balance <= 0 or ps.buy_price <= 0:
+    if ps.asset_balance <= 0 or ps.buy_price <= 0 or ps.position_side == "none":
         return
 
     current_price = ps.current_price
-    step_size = await binance.get_step_size(pair)
-    sell_amount_raw = ps.asset_balance * fraction
-    # Truncate to valid step size using math.floor
-    sell_qty = math.floor(sell_amount_raw / step_size) * step_size if step_size > 0 else sell_amount_raw
+    sell_qty_raw  = ps.asset_balance * fraction
+
+    # Format to valid contract precision using CCXT
+    sell_qty = await futures_execution.format_futures_amount(pair, sell_qty_raw)
 
     if sell_qty <= 0:
         log.warning(f"  {ps.base_asset} TP1 partial sell rounds to 0 — skipping")
         return
 
     notional = sell_qty * current_price
-    if notional < 15:
+    if notional < 5.0:
         log.warning(
-            f"  {ps.base_asset} TP1 below $15 notional "
+            f"  {ps.base_asset} TP1 below $5 notional "
             f"({sell_qty} × {current_price:.4f} = ${notional:.2f}) — converting to full exit"
         )
         await execute_sell(pair, note="TP1_FULL_EXIT")
         return
 
-    try:
-        order = await binance.place_market_sell(pair, sell_qty, current_price=current_price)
-    except ExecutionError as e:
-        log.warning(f"  {ps.base_asset} TP1 ExecutionError: {e}")
-        return
+    order = await futures_execution.execute_futures_exit(pair, ps.position_side, sell_qty)
 
     if order is None:
+        log.warning(f"  {ps.base_asset} TP1 partial exit order failed — skipping TP1")
         return
 
-    filled_qty = float(order.get("executedQty", 0))
-    filled_usdt = float(order.get("cummulativeQuoteQty", 0))
-    avg_price = filled_usdt / filled_qty if filled_qty > 0 else current_price
+    filled_qty  = float(order.get("filled") or sell_qty)
+    avg_price   = float(order.get("average") or current_price)
+    if avg_price <= 0:
+        avg_price = current_price
+    filled_usdt = filled_qty * avg_price
 
     cost_basis = ps.buy_price * filled_qty
     pl = filled_usdt - cost_basis
 
+    # Re-sync futures balance after partial close
+    new_usdt = await futures_execution.get_futures_usdt_balance()
+
     async with state.lock:
         ps.asset_balance -= filled_qty
         if ps.asset_balance < 1e-6:
-            ps.asset_balance = 0.0
+            _clear_position_state(ps)
         ps.position_value_usdt = ps.asset_balance * avg_price
         ps.pl_usdt += pl
         ps.tp1_hit = True
-        # Move stop-loss to break-even + buffer (entry + 0.1%)
+        # Move stop-loss to break-even + buffer
         be_stop = ps.buy_price * (1 + BREAKEVEN_BUFFER_PCT / 100)
         ps.trailing_stop = max(ps.trailing_stop, be_stop)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1353,7 +1401,10 @@ async def execute_partial_sell(pair: str, fraction: float):
             "amount": filled_qty, "usdt": filled_usdt,
             "pl": pl, "time": now_iso,
         }
-        state.usdt_balance += filled_usdt
+        if new_usdt > 0:
+            state.usdt_balance = new_usdt
+        else:
+            state.usdt_balance += filled_usdt
         state.total_trades += 1
         state.total_sells += 1
         if pl > 0:
@@ -1373,37 +1424,50 @@ async def execute_partial_sell(pair: str, fraction: float):
 
 
 async def execute_fvg_entry(pair: str, usdt_to_spend: float):
-    """Place a LIMIT BUY at the FVG midpoint instead of a market buy.
+    """Place a futures LIMIT LONG at the FVG midpoint.
 
-    The limit order parks at the 50% gap level. A separate check in the
-    trading loop (check_fvg_order_fills) monitors for fills and updates
-    the position state when filled.
+    Parks a GTC limit order at the 50% gap level on the USDⓈ-M futures market.
+    check_fvg_order_fills() monitors fill status and updates position state.
+
+    Contract size is derived from risk-parity sizing at the limit price,
+    using the ATR dynamic SL as the risk distance.
     """
     ps = state.pairs[pair]
     if not ps.fvg_detected or ps.fvg_buy_price <= 0:
         return
 
     limit_price = ps.fvg_buy_price
-    step_size = await binance.get_step_size(pair)
-    quantity = binance.calc_quantity(usdt_to_spend, limit_price, step_size)
 
-    if quantity <= 0 or (quantity * limit_price) < 15:
+    # Compute dynamic SL for sizing (same as execute_buy)
+    if ps.atr_pct > 0:
+        _atr_sl_pct = min(ATR_SL_MAX_PCT, max(STOP_LOSS_PCT, ps.atr_pct * ATR_SL_MULTIPLIER * 100))
+    else:
+        _atr_sl_pct = STOP_LOSS_PCT
+    sl_price = limit_price * (1 - _atr_sl_pct / 100)
+
+    live_usdt = await futures_execution.get_futures_usdt_balance()
+    if live_usdt <= 0:
+        live_usdt = state.usdt_balance
+
+    contracts = futures_execution.calculate_futures_position_size(
+        live_usdt, limit_price, sl_price
+    )
+
+    if contracts <= 0 or (contracts * limit_price) < 5.0:
         log.debug(
             f"  {ps.base_asset} FVG limit too small "
-            f"({quantity} × {limit_price:.4f} = ${quantity * limit_price:.2f}) — skipping"
+            f"({contracts:.6f} × {limit_price:.4f} = ${contracts * limit_price:.2f}) — skipping"
         )
         return
 
-    try:
-        order = await binance.place_limit_buy(pair, quantity, limit_price)
-    except ExecutionError as e:
-        log.warning(f"  {ps.base_asset} FVG ExecutionError: {e}")
-        return
+    order = await futures_execution.execute_futures_limit_entry(
+        pair, "buy", contracts, limit_price, FUTURES_LEVERAGE
+    )
 
     if order is None:
         return
 
-    order_id = int(order.get("orderId", 0))
+    order_id = int(order.get("id", 0))
     now_iso = datetime.now(timezone.utc).isoformat()
     async with state.lock:
         ps.fvg_limit_active = True
@@ -1412,53 +1476,57 @@ async def execute_fvg_entry(pair: str, usdt_to_spend: float):
 
     log.info(
         f"{C.CYAN}{C.BOLD} FVG LIMIT {C.RESET} "
-        f"{C.CYAN}{ps.base_asset}{C.RESET} limit buy {quantity:.6f} "
+        f"{C.CYAN}{ps.base_asset}{C.RESET} limit long {contracts:.6f} contracts "
         f"@ ${limit_price:.4f} (gap: ${ps.fvg_bottom:.4f}–${ps.fvg_top:.4f}) "
         f"orderId={order_id}"
     )
 
 
 async def check_fvg_order_fills(pair: str):
-    """Check if a pending FVG limit order has been filled, cancelled, or stale.
+    """Check if a pending FVG futures limit order has been filled, cancelled, or stale.
 
-    Called from the trading loop for pairs with fvg_limit_active=True.
+    Uses CCXT futures order management (futures_execution module).
+    CCXT unified order fields: status='open'|'closed'|'canceled', filled, average.
     """
     ps = state.pairs[pair]
     if not ps.fvg_limit_active or ps.fvg_order_id == 0:
         return
 
-    status = await binance.get_order_status(pair, ps.fvg_order_id)
+    status = await futures_execution.get_futures_order_status(pair, ps.fvg_order_id)
     if status is None:
         return
 
-    order_status = status.get("status", "")
+    order_status = status.get("status", "")    # 'open' | 'closed' | 'canceled'
 
     # ── Order timeout: cancel if limit has been sitting unfilled too long ──
-    if order_status in ("NEW", "PARTIALLY_FILLED") and ps.fvg_order_time:
+    if order_status == "open" and ps.fvg_order_time:
         try:
             placed = datetime.fromisoformat(ps.fvg_order_time)
             if placed.tzinfo is None:
                 placed = placed.replace(tzinfo=timezone.utc)
             age_s = (datetime.now(timezone.utc) - placed).total_seconds()
             if age_s > FVG_ORDER_TIMEOUT:
-                cancelled = await binance.cancel_order(pair, ps.fvg_order_id)
+                cancelled = await futures_execution.cancel_futures_order(pair, ps.fvg_order_id)
                 if cancelled:
                     async with state.lock:
                         ps.fvg_limit_active = False
                         ps.fvg_order_id = 0
                         ps.fvg_order_time = ""
                     log.info(
-                        f"  {ps.base_asset} FVG limit cancelled — "
+                        f"  {ps.base_asset} FVG futures limit cancelled — "
                         f"order open {age_s:.0f}s > {FVG_ORDER_TIMEOUT}s timeout"
                     )
                 return
         except Exception:
             pass
 
-    if order_status == "FILLED":
-        filled_qty = float(status.get("executedQty", 0))
-        filled_usdt = float(status.get("cummulativeQuoteQty", 0))
-        avg_price = filled_usdt / filled_qty if filled_qty > 0 else ps.fvg_buy_price
+    if order_status == "closed":    # CCXT 'closed' = fully filled
+        filled_qty  = float(status.get("filled", 0))
+        avg_price   = float(status.get("average") or ps.fvg_buy_price)
+        filled_usdt = filled_qty * avg_price
+
+        # Re-sync futures balance after fill
+        new_usdt = await futures_execution.get_futures_usdt_balance()
 
         async with state.lock:
             old_cost = ps.asset_balance * ps.buy_price if ps.buy_price > 0 else 0
@@ -1466,16 +1534,18 @@ async def check_fvg_order_fills(pair: str):
             total_cost = old_cost + filled_usdt
             ps.buy_price = total_cost / ps.asset_balance if ps.asset_balance > 0 else avg_price
             ps.position_value_usdt = ps.asset_balance * avg_price
+            ps.position_side = "long"
+            ps.leverage = FUTURES_LEVERAGE
 
             if USE_ATR_EXITS and ps.atr > 0:
-                ps.trailing_stop = avg_price - ps.atr * ATR_TRAILING_MULTIPLIER
+                ps.trailing_stop   = avg_price - ps.atr * ATR_TRAILING_MULTIPLIER
                 ps.atr_take_profit = avg_price + ps.atr * ATR_TP_MULTIPLIER
 
             now_iso = datetime.now(timezone.utc).isoformat()
             ps.position_open_time = now_iso
             ps.tp1_hit = False
-            ps.fvg_entry = True                  # limit fill = FVG entry
-            ps.last_fvg_trade_time = now_iso     # start cooldown
+            ps.fvg_entry = True
+            ps.last_fvg_trade_time = now_iso
             ps.last_trade = {
                 "action": "BUY_FVG", "price": avg_price,
                 "amount": filled_qty, "usdt": filled_usdt,
@@ -1486,37 +1556,41 @@ async def check_fvg_order_fills(pair: str):
             ps.fvg_order_id = 0
             ps.fvg_order_time = ""
             ps.fvg_detected = False
-            state.usdt_balance -= filled_usdt
+
+            if new_usdt > 0:
+                state.usdt_balance = new_usdt
+            else:
+                margin_used = filled_usdt / FUTURES_LEVERAGE
+                state.usdt_balance = max(0.0, state.usdt_balance - margin_used)
             state.total_trades += 1
             state.total_buys += 1
 
         log.info(
             f"{C.BG_GREEN}{C.WHITE}{C.BOLD} FVG FILLED {C.RESET} "
-            f"{C.GREEN}{ps.base_asset}{C.RESET} {filled_qty:.6f} "
-            f"@ ${avg_price:.4f} for {filled_usdt:.2f} USDT"
+            f"{C.GREEN}{ps.base_asset}{C.RESET} {filled_qty:.6f} contracts "
+            f"@ ${avg_price:.4f} ≈ ${filled_usdt:.2f} USDT notional"
         )
         update_portfolio_tracking(state)
         await asyncio.get_running_loop().run_in_executor(None, save_state_to_db, state)
 
-    elif order_status in ("CANCELED", "EXPIRED", "REJECTED"):
+    elif order_status == "canceled":
         async with state.lock:
             ps.fvg_limit_active = False
             ps.fvg_order_id = 0
             ps.fvg_order_time = ""
-        log.info(f"  {ps.base_asset} FVG limit order {order_status.lower()} — cleared")
+        log.info(f"  {ps.base_asset} FVG futures limit order canceled — cleared")
 
     else:
-        # Order still OPEN/PARTIALLY_FILLED — check if price moved too far away
-        # If price is now >2% above the gap_top, cancel (opportunity passed)
+        # Order still open — cancel if price moved >2% above gap_top (opportunity passed)
         if ps.fvg_top > 0 and ps.current_price > ps.fvg_top * 1.02:
-            cancelled = await binance.cancel_order(pair, ps.fvg_order_id)
+            cancelled = await futures_execution.cancel_futures_order(pair, ps.fvg_order_id)
             if cancelled:
                 async with state.lock:
                     ps.fvg_limit_active = False
                     ps.fvg_order_id = 0
                     ps.fvg_order_time = ""
                 log.info(
-                    f"  {ps.base_asset} FVG limit cancelled — price ${ps.current_price:.4f} "
+                    f"  {ps.base_asset} FVG futures limit cancelled — price ${ps.current_price:.4f} "
                     f"moved >2% above gap_top ${ps.fvg_top:.4f}"
                 )
 
@@ -1881,36 +1955,28 @@ async def start():
         state = create_bot_state()
         log.info("Created fresh bot state")
 
-    # Connect to Binance
+    # Connect to Binance (WebSocket + market-data REST via python-binance)
     await binance.connect()
+
+    # ── Futures pre-flight: enforce One-Way Mode via CCXT ─────────────────
+    # Must run before any order is placed. Idempotent — safe to retry.
+    # IMPORTANT: futures testnet keys are separate from spot testnet keys.
+    # Generate them at https://testnet.binancefuture.com before live deployment.
+    try:
+        await futures_execution.enforce_futures_environment()
+    except Exception as e:
+        log.error(f"Futures environment setup failed: {e} — HALTING startup")
+        return
 
     # Initialise Market Dynamics Engine (DataProvider cache + VolumePairList)
     init_market_data(binance)
 
-    # Fetch USDT balance + all coin balances to compute true total portfolio value
-    usdt = await binance.get_balance("USDT")
-    total_value = usdt  # Start with USDT, add coin values below
+    # ── Futures USDT balance ───────────────────────────────────────────────
+    # In futures mode we hold ONLY USDT — never query base-asset spot walances.
+    # Portfolio value = futures wallet total (free + locked margin).
+    usdt = await futures_execution.get_futures_usdt_balance()
+    total_value = usdt      # Futures: portfolio IS the USDT wallet
     num_pairs = len(TRADING_PAIRS)
-
-    for pair_cfg in TRADING_PAIRS:
-        pair = pair_cfg["pair"]
-        base = get_base_asset(pair)
-        coin_balance = await binance.get_balance(base)
-        price = await binance.get_current_price(pair)
-
-        if coin_balance > 0 and price > 0:
-            coin_value = coin_balance * price
-            total_value += coin_value
-            async with state.lock:
-                ps = state.pairs[pair]
-                # Populate position data if the bot doesn't already know about it
-                if ps.asset_balance == 0 or abs(ps.asset_balance - coin_balance) > 1e-8:
-                    ps.asset_balance = coin_balance
-                    ps.position_value_usdt = coin_value
-                    # Use current price as buy_price estimate if unknown
-                    if ps.buy_price <= 0:
-                        ps.buy_price = price
-                    log.info(f"  Detected existing position: {coin_balance:.6f} {base} (~${coin_value:.2f} USDT)")
 
     # Check if we have any trade history — if not, reset start value
     from logger import get_trade_stats
@@ -1978,12 +2044,17 @@ async def start():
 
     exit_mode = "ATR-based" if USE_ATR_EXITS else f"Fixed {PROFIT_TARGET_PCT}%/{STOP_LOSS_PCT}%"
     log.info(
-        f"{C.BOLD}Portfolio: {C.GREEN}${total_value:.2f}{C.RESET} (USDT: ${usdt:.2f} + coins)\n"
+        f"{C.BOLD}Futures Portfolio: {C.GREEN}${total_value:.2f} USDT{C.RESET} "
+        f"({'TESTNET' if USE_TESTNET else 'LIVE'} — USDⓈ-M Perpetuals)\n"
         f"  {C.CYAN}Reserve:{C.RESET}      ${state.usdt_reserved:.2f} ({PORTFOLIO_RESERVE_PCT*100:.0f}% of trading cap)\n"
-        f"  {C.CYAN}Trade size:{C.RESET}   ${trade_size:.2f} ({TRADE_SIZE_PCT*100:.0f}% per trade)\n"
-        f"  {C.CYAN}Max position:{C.RESET} ${max_pos:.2f} ({MAX_POSITION_PCT*100:.0f}% per coin)\n"
-        f"  {C.CYAN}Exit mode:{C.RESET}    {exit_mode} | SL: {STOP_LOSS_PCT}%\n"
-        f"  {C.CYAN}Engine:{C.RESET}       adaptive weights + regime + correlation + BTC crash filter"
+        f"  {C.CYAN}Leverage:{C.RESET}     {FUTURES_LEVERAGE}x isolated margin | "
+        f"Risk: {FUTURES_ACCOUNT_RISK_PCT*100:.1f}% per trade\n"
+        f"  {C.CYAN}Trade size:{C.RESET}   ${trade_size:.2f} ({TRADE_SIZE_PCT*100:.0f}% base) — "
+        f"risk-parity adjusted per ATR\n"
+        f"  {C.CYAN}Exit mode:{C.RESET}    {exit_mode} | SL floor: {STOP_LOSS_PCT}% | "
+        f"Fees: taker {FUTURES_TAKER_FEE*100:.3f}%\n"
+        f"  {C.CYAN}Engine:{C.RESET}       adaptive weights + regime + correlation + BTC crash filter\n"
+        f"  {C.CYAN}Safety:{C.RESET}       One-Way Mode + reduceOnly exits + isolated margin"
     )
 
     # Fetch initial prices for all pairs
@@ -2071,6 +2142,7 @@ async def shutdown():
     log.info("Shutting down...")
     await asyncio.get_running_loop().run_in_executor(None, save_state_to_db, state)
     await binance.disconnect()
+    await futures_execution.close_exchange()    # close CCXT HTTP session
     log.info("Goodbye!")
 
 

@@ -1,7 +1,7 @@
 # Trading Bot — Complete Documentation
 
-> Last updated: 2026-03-28 (rev 4)
-> Mode: **Scalping + Long-Term + Futures Paper** | Exchange: **Binance Spot** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
+> Last updated: 2026-03-28 (rev 5)
+> Mode: **Scalping + Long-Term + Futures (Live)** | Exchange: **Binance USDⓈ-M Futures** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
 
 ---
 
@@ -21,11 +21,12 @@
 12. [Correlation System](#12-correlation-system)
 13. [Market Dynamics Engine](#13-market-dynamics-engine)
 14. [Long-Term Portfolio Layer](#14-long-term-portfolio-layer)
-15. [Futures Paper Trading Layer](#15-futures-paper-trading-layer)
-16. [Discord Control Panel](#16-discord-control-panel)
-17. [Web Dashboard](#17-web-dashboard)
-18. [Database & Logging](#18-database--logging)
-19. [Configuration Reference](#19-configuration-reference)
+15. [Live Futures Execution Layer](#15-live-futures-execution-layer)
+16. [Futures Paper Trading Layer (Simulation)](#16-futures-paper-trading-layer-simulation)
+17. [Discord Control Panel](#17-discord-control-panel)
+18. [Web Dashboard](#18-web-dashboard)
+19. [Database & Logging](#19-database--logging)
+20. [Configuration Reference](#20-configuration-reference)
 
 ---
 
@@ -37,21 +38,24 @@ The bot runs as a **single Python asyncio process**. All components — signal p
 
 ```
 1.  Load .env  →  validate Binance + Discord API keys
-2.  Connect to Binance (testnet or live)
-3.  Load saved state from trades.db (or create fresh)
-4.  Fetch initial prices for all pairs
-5.  Open WebSocket symbol-ticker stream per pair   (price ticks → execution queue)
-6.  Open WebSocket kline-close stream per pair     (candle close → indicator recalc)
-7.  Init Market Dynamics Engine (DataProvider cache + VolumePairList)
-8.  Start signal polling tasks per pair (staggered 5s apart to spread rate limits)
-9.  Start portfolio management tasks
-10. Start event-driven execution worker
-11. Start kline-close indicator worker (Phase 5)
-12. Start long-term portfolio loop (if enabled)
-13. Start futures paper trading loop (if enabled)
-14. Start Market Dynamics refresh loop
-15. Launch Discord bot
-16. Start FastAPI web dashboard server
+2.  Connect to Binance WebSocket/REST (python-binance)
+3.  Enforce futures pre-flight via CCXT:
+      · enforce_futures_environment() — set One-Way Mode (dualSidePosition=false)
+4.  Load saved state from trades.db (or create fresh)
+5.  Fetch futures USDT wallet balance (CCXT — futures wallet only, no coin balances)
+6.  Fetch initial prices for all pairs (python-binance REST)
+7.  Open WebSocket symbol-ticker stream per pair   (price ticks → execution queue)
+8.  Open WebSocket kline-close stream per pair     (candle close → indicator recalc)
+9.  Init Market Dynamics Engine (DataProvider cache + VolumePairList)
+10. Start signal polling tasks per pair (staggered 5s apart to spread rate limits)
+11. Start portfolio management tasks
+12. Start event-driven execution worker
+13. Start kline-close indicator worker (Phase 5)
+14. Start long-term portfolio loop (if enabled)
+15. Start futures paper trading loop (if enabled)
+16. Start Market Dynamics refresh loop
+17. Launch Discord bot
+18. Start FastAPI web dashboard server
 ```
 
 ### Event-Driven Execution Model
@@ -92,17 +96,18 @@ The 10-second REST polling loop (`poll_rsi`) remains active as a fallback. Both 
 
 | File | Purpose |
 |------|---------|
-| `bot.py` | Main entry point, event loop, signal pollers, order execution |
+| `bot.py` | Main entry point, event loop, signal pollers, futures order execution |
+| `futures_execution.py` | **CCXT USDⓈ-M order engine** — entry/exit/sizing/One-Way/isolated margin |
 | `strategy.py` | Decision engine: confidence scoring, all BUY/SELL logic |
 | `config.py` | All tuneable parameters — single source of truth |
-| `state.py` | `BotState`, `PairState`, `FuturesPaperState`, `LongTermState` dataclasses + DB persistence |
+| `state.py` | `BotState`, `PairState` (+ `position_side`, `leverage`), `FuturesPaperState`, `LongTermState` |
 | `regime.py` | Regime classification (ATR + EMA spread) |
 | `portfolio.py` | Portfolio value tracking, reserve management |
 | `signal_weights.py` | Adaptive weight learning from trade history |
 | `market_data.py` | DataProvider (kline cache) + VolumePairList (dynamic pairlist) |
-| `futures_paper.py` | Simulated futures SHORT/LONG paper positions |
+| `futures_paper.py` | Simulated futures SHORT/LONG paper positions (separate from live layer) |
 | `backtest_engine.py` | Offline historical backtesting engine |
-| `binance_client.py` | Async python-binance wrapper: REST + WebSocket |
+| `binance_client.py` | python-binance: WebSocket streams + market-data REST (read-only) |
 | `signals/rsi.py` | RSI, MACD, BB, ATR, regime, wick ratio, liquidity sweep, structure_score, volatility_score |
 | `signals/fvg.py` | Fair Value Gap detection on 5m candles |
 | `signals/orderbook.py` | Orderbook imbalance + trade flow (microstructure) |
@@ -691,9 +696,90 @@ A separate "macro hold" strategy running in `long_term_loop()` alongside the sca
 
 ---
 
-## 15. Futures Paper Trading Layer
+## 15. Live Futures Execution Layer
 
-`futures_paper.py` adds **fully simulated** SHORT and LONG positions. No real Binance futures orders are placed. Completely isolated from spot P/L.
+`futures_execution.py` — the CCXT-based USDⓈ-M real-order engine. Replaces the legacy spot order calls (`place_market_buy` / `place_market_sell`) with proper perpetual futures routing.
+
+### Architecture Split
+
+| Concern | Library | File |
+|---------|---------|------|
+| Price WebSocket streams | python-binance | `binance_client.py` |
+| Kline-close streams | python-binance | `binance_client.py` |
+| Orderbook / trade-flow REST | python-binance | `binance_client.py` |
+| OHLCV klines for indicators | python-binance | `binance_client.py` |
+| **All order execution** | **CCXT** | **`futures_execution.py`** |
+| **Balance queries** | **CCXT** | **`futures_execution.py`** |
+
+### Key Safety Invariants
+
+| Invariant | Implementation |
+|-----------|---------------|
+| **One-Way Mode** | `enforce_futures_environment()` at startup — `dualSidePosition=false` |
+| **Isolated Margin** | `prepare_market_for_entry()` before every entry — no cross-margin |
+| **Fixed Leverage** | `prepare_market_for_entry()` sets `FUTURES_LEVERAGE` before every entry |
+| **reduceOnly exits** | `execute_futures_exit()` always passes `params={'reduceOnly': True}` |
+| **USDT-only balance** | `get_futures_usdt_balance()` — never queries base-asset spot wallets |
+
+### Order Flow
+
+```
+BUY signal
+    │
+    ├─ calculate_futures_position_size(usdt_balance, entry_price, sl_price)
+    │    = (balance × FUTURES_ACCOUNT_RISK_PCT) / sl_distance_pct / entry_price
+    │
+    ├─ prepare_market_for_entry(symbol, FUTURES_LEVERAGE)
+    │    · set_margin_mode('isolated', symbol)
+    │    · set_leverage(5, symbol)
+    │
+    └─ create_order(type='market', side='buy', amount=contracts)
+         ps.position_side = "long"
+
+SELL/exit signal
+    │
+    ├─ execute_futures_exit(symbol, position_side='long', contracts)
+    │
+    └─ create_order(type='market', side='sell', amount=contracts,
+                    params={'reduceOnly': True})   ← CRITICAL
+         ps.position_side = "none"
+```
+
+### Position Sizing (Futures Risk Parity)
+
+```
+sl_distance_pct = |entry_price - sl_price| / entry_price
+max_dollar_loss = usdt_balance × FUTURES_ACCOUNT_RISK_PCT   (default 1%)
+notional        = max_dollar_loss / sl_distance_pct
+notional        = min(notional, usdt_balance × leverage × 0.95)
+contracts       = notional / entry_price
+```
+
+**Example** (ETH @ $3,000, ATR-SL = 0.75%, 1% risk, 5x leverage, $1,000 balance):
+```
+sl_distance = 0.75%  →  max_loss = $10  →  notional = $1,333  →  contracts = 0.444
+margin_locked = $1,333 / 5 = $267   (26.7% of balance)
+```
+
+### Fee Constants (USDⓈ-M Perpetuals)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `FUTURES_MAKER_FEE` | 0.0002 (0.02%) | Limit orders — used for fee logging |
+| `FUTURES_TAKER_FEE` | 0.0005 (0.05%) | Market orders — used for fee logging |
+| `ROUND_TRIP_COST_PCT` | 0.15% | Taker round-trip cost (2 × 0.05% + slippage) |
+
+### Testnet Note
+
+Futures testnet API keys are **separate** from spot testnet keys.
+Generate them at: https://testnet.binancefuture.com
+Set as `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` in `.env`.
+
+---
+
+## 16. Futures Paper Trading Layer (Simulation)
+
+`futures_paper.py` adds **fully simulated** SHORT and LONG positions. No real Binance futures orders are placed. Completely isolated from live futures P/L.
 
 ### Overview
 
@@ -782,7 +868,7 @@ Tracked separately in `state.futures_paper_realized_pnl`, `futures_paper_total_t
 
 ---
 
-## 16. Discord Control Panel
+## 17. Discord Control Panel
 
 Auto-refreshes every **45 seconds**.
 
@@ -820,7 +906,7 @@ All buttons locked to `DISCORD_OWNER_ID`.
 
 ---
 
-## 17. Web Dashboard
+## 18. Web Dashboard
 
 FastAPI + uvicorn server embedded in the main bot process at `http://localhost:8081`.
 
@@ -833,7 +919,7 @@ FastAPI + uvicorn server embedded in the main bot process at `http://localhost:8
 
 ---
 
-## 18. Database & Logging
+## 19. Database & Logging
 
 All trade history in **`trades.db`** (SQLite, **WAL journal mode** — crash-safe writes).
 
@@ -865,7 +951,7 @@ Every trade stores the full signal state at entry as a JSON blob — used by the
 
 ---
 
-## 19. Configuration Reference
+## 20. Configuration Reference
 
 All values in `config.py`. This is the single source of truth — edit here first, then update this document.
 
@@ -927,7 +1013,17 @@ All values in `config.py`. This is the single source of truth — edit here firs
 | `BTC_CRASH_SIZE_MULTIPLIER` | 0.25× | 25% position size during crash |
 | `BTC_CRASH_COOLDOWN` | 900s | Risk-off duration after crash trigger |
 
-### Futures Paper
+### Live Futures Execution (USDⓈ-M)
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `FUTURES_LEVERAGE` | 5 | Default leverage for real futures positions |
+| `FUTURES_ACCOUNT_RISK_PCT` | 0.01 (1%) | Max account risk per trade |
+| `FUTURES_MAKER_FEE` | 0.0002 | Binance USDⓈ-M maker fee (0.02%) |
+| `FUTURES_TAKER_FEE` | 0.0005 | Binance USDⓈ-M taker fee (0.05%) |
+| `ROUND_TRIP_COST_PCT` | 0.15% | Futures taker round-trip (fee + slippage) |
+
+### Futures Paper (Simulation)
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|

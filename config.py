@@ -35,13 +35,21 @@ ATR_MAX_TRAIL_PCT = 0.02        # Max trail distance once in profit (2% of price
 ATR_TRAIL_ACTIVATION_PCT = 0.25 # Trail activates after meaningful move — avoids noise stop-outs on small bounces
 USE_ATR_EXITS = True            # True = ATR-based exits, False = fixed % exits
 
+# ─── Live Futures Execution (USDⓈ-M) ────────────────────────────────────────
+# Real order routing via CCXT (futures_execution.py).
+# Testnet: keys must be from https://testnet.binancefuture.com (separate from spot testnet)
+FUTURES_LEVERAGE          = 5       # Default leverage applied to every scalp position
+FUTURES_ACCOUNT_RISK_PCT  = 0.01    # 1% of USDT wallet = max dollar loss per trade
+FUTURES_MAKER_FEE         = 0.0002  # Binance USDⓈ-M maker fee (0.02% — limit orders)
+FUTURES_TAKER_FEE         = 0.0005  # Binance USDⓈ-M taker fee (0.05% — market orders)
+
 # ─── Economic Viability Constants ────────────────────────────────────
-# Round-trip execution cost assumption:
-#   Binance spot fee: 0.1% per side = 0.2% round-trip
+# Round-trip execution cost assumption (futures taker both sides):
+#   USDⓈ-M taker fee: 0.05% per side = 0.10% round-trip
 #   Slippage (market order): ~0.03–0.05%
-#   Total: ~0.25% round-trip cost
+#   Total: ~0.15% round-trip cost (futures) vs 0.25% (spot)
 # A trade must have realistic expected profit ABOVE this to be worthwhile.
-ROUND_TRIP_COST_PCT = 0.25      # Assumed total round-trip cost (fee + slippage)
+ROUND_TRIP_COST_PCT = 0.15      # Futures taker round-trip cost (fee + slippage)
 ECONOMIC_MIN_REWARD_PCT = 0.50  # Minimum expected reward for a setup to be economically viable
                                 # Raised from 0.35 → 0.50: aligns with new BASE_TP1_PCT=0.6%
                                 # ATR × ATR_TP_MULTIPLIER × 100 must clear this before entry
