@@ -49,20 +49,19 @@ exchange = ccxt.binance({
 })
 
 if USE_TESTNET:
-    # ccxt 4.5+ removed set_sandbox_mode for Binance futures.
-    # Override all 6 fapi URL keys manually so every request — including
-    # fetch_balance (fapiPrivateV2) and newer endpoints (fapiPrivateV3) —
-    # routes to testnet.binancefuture.com instead of fapi.binance.com.
-    _FAPI_TESTNET_V1 = "https://testnet.binancefuture.com/fapi/v1"
-    _FAPI_TESTNET_V2 = "https://testnet.binancefuture.com/fapi/v2"
-    _FAPI_TESTNET_V3 = "https://testnet.binancefuture.com/fapi/v3"
-    exchange.urls["api"]["fapiPublic"]   = _FAPI_TESTNET_V1
-    exchange.urls["api"]["fapiPrivate"]  = _FAPI_TESTNET_V1
-    exchange.urls["api"]["fapiPublicV2"] = _FAPI_TESTNET_V2
-    exchange.urls["api"]["fapiPrivateV2"]= _FAPI_TESTNET_V2
-    exchange.urls["api"]["fapiPublicV3"] = _FAPI_TESTNET_V3
-    exchange.urls["api"]["fapiPrivateV3"]= _FAPI_TESTNET_V3
-    logger.info("Futures execution: TESTNET mode active (testnet.binancefuture.com)")
+    # Binance Demo Trading endpoint — keys generated at testnet.binancefuture.com
+    # The actual API base is demo-fapi.binance.com (NOT testnet.binancefuture.com).
+    # Override all 6 fapi URL keys so every ccxt request routes correctly.
+    _FAPI_DEMO_V1 = "https://demo-fapi.binance.com/fapi/v1"
+    _FAPI_DEMO_V2 = "https://demo-fapi.binance.com/fapi/v2"
+    _FAPI_DEMO_V3 = "https://demo-fapi.binance.com/fapi/v3"
+    exchange.urls["api"]["fapiPublic"]    = _FAPI_DEMO_V1
+    exchange.urls["api"]["fapiPrivate"]   = _FAPI_DEMO_V1
+    exchange.urls["api"]["fapiPublicV2"]  = _FAPI_DEMO_V2
+    exchange.urls["api"]["fapiPrivateV2"] = _FAPI_DEMO_V2
+    exchange.urls["api"]["fapiPublicV3"]  = _FAPI_DEMO_V3
+    exchange.urls["api"]["fapiPrivateV3"] = _FAPI_DEMO_V3
+    logger.info("Futures execution: DEMO mode active (demo-fapi.binance.com)")
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
