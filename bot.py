@@ -58,6 +58,7 @@ from config import (
     FUTURES_PAPER_ENABLED,
     FUTURES_LEVERAGE, FUTURES_ACCOUNT_RISK_PCT,
     FUTURES_MAKER_FEE, FUTURES_TAKER_FEE,
+    AUDIT_MODE, AUDIT_MICRO_NOTIONAL,
     get_base_asset,
 )
 import futures_execution
@@ -1951,6 +1952,29 @@ async def start():
     if saved_state is not None:
         state = saved_state
         log.info("Restored state from trades.db")
+        # ── Phase 8: WAL Recovery Audit ───────────────────────────────────────
+        # After a crash or kill -9, list every open position recovered from WAL.
+        # Proves the SQLite WAL survived the termination and position_side is intact.
+        recovered = [
+            (pair, ps)
+            for pair, ps in state.pairs.items()
+            if ps.asset_balance > 0 and ps.position_side != "none"
+        ]
+        if recovered:
+            log.warning(
+                f"{'─'*60}\n"
+                f"  ⚡ WAL RECOVERY: {len(recovered)} open position(s) restored\n"
+                + "".join(
+                    f"  → {pair}: {ps.position_side.upper()} "
+                    f"{ps.asset_balance:.6f} contracts @ ${ps.buy_price:,.4f}  "
+                    f"[SL: ${ps.buy_price * (1 - STOP_LOSS_PCT/100):,.4f}]\n"
+                    for pair, ps in recovered
+                )
+                + f"  Bot will resume exit monitoring immediately.\n"
+                f"{'─'*60}"
+            )
+        else:
+            log.info("WAL recovery: no open positions — clean slate")
     else:
         state = create_bot_state()
         log.info("Created fresh bot state")
@@ -2040,6 +2064,16 @@ async def start():
             f"budget=${lt_budget:,.2f} ({LONG_TERM_ALLOCATION*100:.0f}%)  "
             f"deployed=${state.lt_capital_deployed:,.2f}  "
             f"trading_cap=${trading_cap:,.2f} ({(1-LONG_TERM_ALLOCATION)*100:.0f}%)"
+        )
+
+    # ── Phase 8: Audit Mode banner ─────────────────────────────────────────────
+    if AUDIT_MODE:
+        log.warning(
+            f"\n{'━'*60}\n"
+            f"  ⚠️  AUDIT MODE ACTIVE (Phase 8 Execution Audit)\n"
+            f"  Risk Parity DISABLED — all trades forced to ${AUDIT_MICRO_NOTIONAL:.0f} USDT notional\n"
+            f"  Set AUDIT_MODE=False in .env to restore full sizing\n"
+            f"{'━'*60}"
         )
 
     exit_mode = "ATR-based" if USE_ATR_EXITS else f"Fixed {PROFIT_TARGET_PCT}%/{STOP_LOSS_PCT}%"

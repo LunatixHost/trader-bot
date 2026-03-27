@@ -39,6 +39,14 @@ ATR_MAX_TRAIL_PCT = 0.02        # Max trail distance once in profit (2% of price
 ATR_TRAIL_ACTIVATION_PCT = 0.25 # Trail activates after meaningful move — avoids noise stop-outs on small bounces
 USE_ATR_EXITS = True            # True = ATR-based exits, False = fixed % exits
 
+# ─── Phase 8: Execution Audit Mode ──────────────────────────────────────────
+# When True, overrides Phase 4 Risk Parity and forces every futures trade to the
+# minimum allowable notional (~6 USDT). Use this to validate the live execution
+# pipe, reduceOnly integrity, and WAL crash recovery without material risk.
+# Set AUDIT_MODE=False in .env to restore full risk-parity sizing.
+AUDIT_MODE = os.getenv("AUDIT_MODE", "True") == "True"
+AUDIT_MICRO_NOTIONAL = 6.0      # USDT notional forced in audit mode (Binance min ~5 USDT)
+
 # ─── Live Futures Execution (USDⓈ-M) ────────────────────────────────────────
 # Real order routing via CCXT (futures_execution.py).
 # Testnet: keys must be from https://testnet.binancefuture.com (separate from spot testnet)

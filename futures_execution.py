@@ -23,6 +23,7 @@ from config import (
     BINANCE_FUTURES_API_KEY, BINANCE_FUTURES_SECRET_KEY, USE_TESTNET,
     FUTURES_LEVERAGE, FUTURES_ACCOUNT_RISK_PCT, STOP_LOSS_PCT,
     ATR_SL_MULTIPLIER, ATR_SL_MAX_PCT,
+    AUDIT_MODE, AUDIT_MICRO_NOTIONAL,
 )
 
 logger = logging.getLogger("trading_bot.futures_exec")
@@ -161,9 +162,13 @@ def calculate_futures_position_size(
     account_risk_pct: float | None = None,
     leverage: int | None = None,
 ) -> float:
-    """Compute contract size based on strict dollar-risk (Phase 5 risk parity).
+    """Compute contract size based on strict dollar-risk (Phase 4 risk parity).
 
-    Formula:
+    Phase 8 AUDIT MODE: when AUDIT_MODE=True (env default), bypasses all risk-parity
+    math and forces every trade to AUDIT_MICRO_NOTIONAL (6 USDT). This validates the
+    live execution pipe with minimum capital exposure before full deployment.
+
+    Normal formula (AUDIT_MODE=False):
         sl_distance = |entry_price - sl_price| / entry_price
         max_loss    = usdt_balance × account_risk_pct
         notional    = max_loss / sl_distance
@@ -177,12 +182,25 @@ def calculate_futures_position_size(
         Number of base-asset contracts (float).
         Returns 0.0 if any input is invalid or degenerate.
     """
+    if entry_price <= 0:
+        return 0.0
+
+    # ── Phase 8: Audit Mode override ─────────────────────────────────────────
+    if AUDIT_MODE:
+        logger.warning(
+            f"⚠️  AUDIT MODE ACTIVE — Risk Parity overridden. "
+            f"Forcing micro-notional: ${AUDIT_MICRO_NOTIONAL:.1f} USDT "
+            f"(set AUDIT_MODE=False in .env to restore full sizing)"
+        )
+        return AUDIT_MICRO_NOTIONAL / entry_price
+
+    # ── Normal Phase 4 Risk Parity ────────────────────────────────────────────
     if account_risk_pct is None:
         account_risk_pct = FUTURES_ACCOUNT_RISK_PCT
     if leverage is None:
         leverage = FUTURES_LEVERAGE
 
-    if entry_price <= 0 or sl_price <= 0 or usdt_balance <= 0:
+    if sl_price <= 0 or usdt_balance <= 0:
         return 0.0
 
     sl_distance = abs(entry_price - sl_price) / entry_price
@@ -356,8 +374,28 @@ async def execute_futures_exit(
             f"@ ~${fill_price:.4f}"
         )
         return order
-    except Exception as e:
+    except ccxt.ExchangeError as e:
+        err_str = str(e)
+        # -2022: ReduceOnly Order is rejected (position already flat)
+        # -4061: Order's notional must be less than allowed (dust)
+        # These are expected during the Phase 8 reduceOnly stress test and on
+        # normal position close races — log info not error, return sentinel.
+        if "-2022" in err_str or "ReduceOnly" in err_str:
+            logger.info(
+                f"FUTURES EXIT {symbol}: reduceOnly rejected — position already "
+                f"closed on exchange (safe to clear local state). Detail: {e}"
+            )
+            return {"_already_closed": True, "filled": contracts, "average": 0}
+        if "-4061" in err_str or "notional" in err_str.lower():
+            logger.warning(
+                f"FUTURES EXIT {symbol}: dust notional rejected by exchange — "
+                f"clearing local state. Detail: {e}"
+            )
+            return {"_dust_reject": True, "filled": contracts, "average": 0}
         logger.error(f"execute_futures_exit failed for {symbol}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"execute_futures_exit unexpected error for {symbol}: {e}")
         return None
 
 

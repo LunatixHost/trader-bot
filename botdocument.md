@@ -1,6 +1,6 @@
 # Trading Bot — Complete Documentation
 
-> Last updated: 2026-03-28 (rev 6)
+> Last updated: 2026-03-28 (rev 7)
 > Mode: **Scalping + Long-Term + Futures (Live)** | Exchange: **Binance USDⓈ-M Futures** | Pairs: ETH, BTC, BNB, XRP, BCH, SUI
 
 ---
@@ -960,7 +960,75 @@ Every trade stores the full signal state at entry as a JSON blob — used by the
 
 ---
 
-## 20. Configuration Reference
+## 20. Phase 8 — Execution Audit & Chaos Testing
+
+Validates the live execution pipe, `reduceOnly` integrity, and WAL crash recovery before deploying full Risk Parity sizing.
+
+### 20.1 Audit Mode
+
+| Config | Default | Meaning |
+|--------|---------|---------|
+| `AUDIT_MODE` | `True` | Overrides Phase 4 sizing — forces every trade to `AUDIT_MICRO_NOTIONAL` |
+| `AUDIT_MICRO_NOTIONAL` | `6.0 USDT` | Notional per trade in audit mode (Binance minimum ~5 USDT) |
+
+Set via `.env`:
+```
+AUDIT_MODE=True    # Phase 8 testing
+AUDIT_MODE=False   # Full Risk Parity restored (post-audit)
+```
+
+On startup, if `AUDIT_MODE=True`, the bot logs a visible banner:
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠️  AUDIT MODE ACTIVE (Phase 8 Execution Audit)
+  Risk Parity DISABLED — all trades forced to $6 USDT notional
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 20.2 Chaos Monkey — WAL Recovery Test
+
+1. Boot bot in Audit Mode
+2. Wait for a 3-minute kline-close WebSocket to trigger an entry
+3. Verify on Binance UI: position is **Isolated**, leverage is correct
+4. **`kill -9 <pid>`** — hard kill, no graceful shutdown
+5. Reboot the bot
+6. **Expected log output:**
+```
+⚡ WAL RECOVERY: 1 open position(s) restored
+→ ETHUSDT: LONG 0.003000 contracts @ $2,150.0000  [SL: $2,139.2500]
+Bot will resume exit monitoring immediately.
+```
+
+Pass criteria: `position_side`, `asset_balance`, and `buy_price` all match pre-kill values. Bot immediately resumes TP/SL monitoring without re-entering.
+
+### 20.3 reduceOnly Stress Test
+
+1. Allow bot to enter a Micro-Notional Long
+2. **Manually close the position on the Binance UI**
+3. Wait for the bot's TP or SL to trigger
+4. Bot sends `reduceOnly=True` sell — Binance returns error `-2022`
+5. **Expected log output:**
+```
+FUTURES EXIT ETHUSDT: reduceOnly rejected — position already closed on exchange (safe to clear local state).
+```
+
+Pass criteria: Bot logs info (not error), clears local state cleanly, **does not open a Short**, does not crash.
+
+### 20.4 Graduation Checklist
+
+Before disabling Audit Mode and enabling full Risk Parity:
+
+- [ ] Isolated margin confirmed in Binance UI on every entry
+- [ ] Leverage matches `FUTURES_LEVERAGE` config value
+- [ ] WAL recovery log matches pre-kill state after `kill -9`
+- [ ] `reduceOnly` rejection logged as info, no crash, no reversed position
+- [ ] P/L accounting is correct (check EQUITY Discord channel vs Binance UI)
+
+Set `AUDIT_MODE=False` in `.env` to graduate to full institutional sizing.
+
+---
+
+## 21. Configuration Reference
 
 All values in `config.py`. This is the single source of truth — edit here first, then update this document.
 
